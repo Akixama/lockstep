@@ -1,6 +1,6 @@
 [build]
-  command = "npx next build
- publish = .next
+  command = "npx next build"
+  publish = ".next"
 
 [build.environment]
- NODE_VERSION = 24
+  NODE_VERSION = "24"
