@@ -1,0 +1,62 @@
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import test from "node:test";
+
+const sourceUrl = new URL("../app/lockstep-app.tsx", import.meta.url);
+const tradingSourceUrl = new URL("../app/trading.ts", import.meta.url);
+
+test("Migration Paper starts from its confirmed defaults instead of legacy settings", async () => {
+  const source = await readFile(sourceUrl, "utf8");
+
+  assert.match(source, /buyAmount:\s*5,/);
+  assert.match(source, /buyAmount:\s*5,\s*\n\s*slippage:\s*50,/);
+  assert.match(source, /takeProfit:\s*300,/);
+  assert.match(source, /paperStartingBalance:\s*10,/);
+  assert.match(source, /boostEntryMinMarketCapUsd:\s*1600,/);
+  assert.match(source, /boostEntryMarketCapUsd:\s*2400,/);
+  assert.match(source, /lockstep\.settings\.migration\.v14/);
+  assert.match(source, /lockstep\.settings\.migration-live\.v2/);
+  assert.match(source, /useState\(migrationDefaults\.paperStartingBalance\)/);
+  assert.match(source, /rawMigrationSettings \? JSON\.parse\(rawMigrationSettings\) : \{\}/);
+  assert.doesNotMatch(source, /rawMigrationSettings \? JSON\.parse\(rawMigrationSettings\) : legacySettings/);
+  assert.match(source, /const executableBuyAmount = migrationExecutionSettings\.buyAmount/);
+  assert.match(source, /Exact \$\{executableBuyAmount\.toFixed\(4\)\} SOL transaction could not be built/);
+  assert.match(source, /crossedRugTrigger/);
+  assert.match(source, /hasObservedAboveEntryBand/);
+  assert.match(source, /streamedMarketCapUsd >= migrationExecutionSettings\.boostEntryMinMarketCapUsd/);
+  assert.match(source, /marketCapUsd >= migrationExecutionSettings\.boostEntryMinMarketCapUsd/);
+  assert.match(source, /outside \$\{rugTriggerLabel\}/);
+  assert.match(source, /Live trades \+ backup polling/);
+  assert.doesNotMatch(source, /PUMPPORTAL API KEY/);
+  assert.doesNotMatch(source, /PUMPPORTAL_API_KEY/);
+  assert.match(source, /nextSliceAt: completedAt \+ current\.paperExitPlan\.intervalSeconds \* 1000/);
+  assert.match(source, /nextSliceAt: attemptedAt \+ 2_000/);
+  assert.doesNotMatch(source, /nextSliceAt: current\.paperExitPlan\.nextSliceAt \+ current\.paperExitPlan\.intervalSeconds \* 1000/);
+});
+
+test("New Pairs quotes fresh launches from realtime bonding-curve reserves", async () => {
+  const source = await readFile(sourceUrl, "utf8");
+  const tradingSource = await readFile(tradingSourceUrl, "utf8");
+
+  assert.match(tradingSource, /virtualSolReserves:\s*solReserve/);
+  assert.match(tradingSource, /virtualTokenReserves:\s*tokenReserve/);
+  assert.match(tradingSource, /fetchLiveBuyQuote\(candidate:\s*LaunchCandidate/);
+  assert.match(source, /checking live \$\{adaptiveAmount\} SOL impact/);
+  assert.doesNotMatch(source, /checking executable 0\.5 SOL quote/);
+});
+
+test("Migration Paper excludes Mayhem coins before opening a BOOST watch", async () => {
+  const source = await readFile(tradingSourceUrl, "utf8");
+
+  assert.match(source, /coin\.is_mayhem_mode === true/);
+  assert.match(source, /if \(mark\.isMayhemMode\) throw new Error/);
+});
+
+test("Migration feed reuses one websocket for metered token-trade watches", async () => {
+  const source = await readFile(tradingSourceUrl, "utf8");
+
+  assert.match(source, /subscribeTokenTrade/);
+  assert.match(source, /unsubscribeTokenTrade/);
+  assert.match(source, /tradeListeners = new Map/);
+  assert.equal((source.match(/new WebSocket/g) ?? []).length, 2);
+});
