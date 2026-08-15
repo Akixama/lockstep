@@ -60,3 +60,13 @@ test("Migration feed reuses one websocket for metered token-trade watches", asyn
   assert.match(source, /tradeListeners = new Map/);
   assert.equal((source.match(/new WebSocket/g) ?? []).length, 2);
 });
+
+test("Wallet backup requires local password confirmation before revealing a private key", async () => {
+  const source = await readFile(sourceUrl, "utf8");
+
+  assert.match(source, /await decryptWallet\(storedWallet, backupPassword\)/);
+  assert.match(source, /bs58\.encode\(keypair\.secretKey\)/);
+  assert.match(source, /anyone with this private key controls the wallet/i);
+  assert.match(source, /30_000/);
+  assert.match(source, /setRevealedPrivateKey\(""\)/);
+});

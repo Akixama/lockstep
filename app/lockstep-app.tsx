@@ -256,7 +256,20 @@ export default function LockstepApp() {
   const strategyModeRef = useRef<StrategyMode>("migration-paper");
   const [executionActivity, setExecutionActivity] = useState<ActivityItem[]>([]);
   const [activationOpen, setActivationOpen] = useState(false);
+  const [backupOpen, setBackupOpen] = useState(false);
+  const [backupPassword, setBackupPassword] = useState("");
+  const [backupAcknowledged, setBackupAcknowledged] = useState(false);
+  const [backupError, setBackupError] = useState("");
+  const [backupBusy, setBackupBusy] = useState(false);
+  const [revealedPrivateKey, setRevealedPrivateKey] = useState("");
+  const [privateKeyVisible, setPrivateKeyVisible] = useState(false);
+  const [privateKeyCopied, setPrivateKeyCopied] = useState(false);
+  const privateKeyClearTimer = useRef<number | null>(null);
   const [hydrated, setHydrated] = useState(false);
+
+  useEffect(() => () => {
+    if (privateKeyClearTimer.current !== null) window.clearTimeout(privateKeyClearTimer.current);
+  }, []);
 
   useEffect(() => {
     const hydrate = window.setTimeout(() => {
@@ -451,6 +464,12 @@ export default function LockstepApp() {
   };
 
   const lockWallet = () => {
+    if (privateKeyClearTimer.current !== null) window.clearTimeout(privateKeyClearTimer.current);
+    privateKeyClearTimer.current = null;
+    setRevealedPrivateKey("");
+    setBackupPassword("");
+    setBackupAcknowledged(false);
+    setBackupOpen(false);
     keypairRef.current = null;
     setUnlocked(false);
     setEngineMode("paused");
@@ -1032,6 +1051,63 @@ export default function LockstepApp() {
     addExecutionActivity("Encrypted backup exported", "Store it privately; the wallet password is required to unlock it", "good");
   };
 
+  const closeBackup = () => {
+    if (privateKeyClearTimer.current !== null) window.clearTimeout(privateKeyClearTimer.current);
+    privateKeyClearTimer.current = null;
+    setBackupOpen(false);
+    setBackupPassword("");
+    setBackupAcknowledged(false);
+    setBackupError("");
+    setBackupBusy(false);
+    setRevealedPrivateKey("");
+    setPrivateKeyVisible(false);
+    setPrivateKeyCopied(false);
+  };
+
+  const revealPrivateKey = async () => {
+    if (!storedWallet) return;
+    setBackupError("");
+    if (!backupAcknowledged) {
+      setBackupError("Confirm that you understand the private-key warning first");
+      return;
+    }
+    if (!backupPassword) {
+      setBackupError("Enter the wallet password used to encrypt this backup");
+      return;
+    }
+    setBackupBusy(true);
+    try {
+      const keypair = await decryptWallet(storedWallet, backupPassword);
+      const privateKey = bs58.encode(keypair.secretKey);
+      setRevealedPrivateKey(privateKey);
+      setBackupPassword("");
+      setPrivateKeyVisible(false);
+      setPrivateKeyCopied(false);
+      if (privateKeyClearTimer.current !== null) window.clearTimeout(privateKeyClearTimer.current);
+      privateKeyClearTimer.current = window.setTimeout(() => {
+        setRevealedPrivateKey("");
+        setPrivateKeyVisible(false);
+        setPrivateKeyCopied(false);
+        privateKeyClearTimer.current = null;
+      }, 30_000);
+    } catch {
+      setBackupError("Incorrect password or damaged wallet data");
+    } finally {
+      setBackupBusy(false);
+    }
+  };
+
+  const copyPrivateKey = async () => {
+    if (!revealedPrivateKey) return;
+    try {
+      await navigator.clipboard.writeText(revealedPrivateKey);
+      setPrivateKeyCopied(true);
+      window.setTimeout(() => setPrivateKeyCopied(false), 1800);
+    } catch {
+      setBackupError("Clipboard access was blocked. Select and copy the key manually.");
+    }
+  };
+
   const uploadKeypair = async (file?: File) => {
     if (!file) return;
     setImportValue(await file.text());
@@ -1175,7 +1251,7 @@ export default function LockstepApp() {
         <div className="app-nav-actions">
           <span className={`network-pill ${paperMode ? "paper-network" : ""}`}><i /> {paperMode ? "PAPER LAB · LIVE DATA" : "MAINNET · REAL SOL"}</span>
           <button className="wallet-chip" onClick={copyAddress}><span>LS</span><b>{shortAddress(address)}</b><small>{copied ? "COPIED" : "COPY"}</small></button>
-          <button className="lock-button" onClick={downloadBackup}>Backup</button>
+          <button className="lock-button" onClick={() => setBackupOpen(true)}>Backup</button>
           <button className="lock-button" onClick={lockWallet}>Lock</button>
         </div>
       </header>
@@ -1238,6 +1314,29 @@ export default function LockstepApp() {
       </div>
 
       {settingsOpen && <SettingsDrawer initialMode={strategyMode} migrationSettings={migrationSettings} migrationLiveSettings={migrationLiveSettings} newPairsSettings={newPairsSettings} onClose={() => setSettingsOpen(false)} onSave={(nextMigration, nextMigrationLive, nextNewPairs) => { setMigrationSettings(nextMigration); setMigrationLiveSettings(nextMigrationLive); setNewPairsSettings(nextNewPairs); localStorage.setItem(MIGRATION_SETTINGS_KEY, JSON.stringify(nextMigration)); localStorage.setItem(MIGRATION_LIVE_SETTINGS_KEY, JSON.stringify(nextMigrationLive)); localStorage.setItem(NEW_PAIRS_SETTINGS_KEY, JSON.stringify(nextNewPairs)); setSettingsOpen(false); }} />}
+      {backupOpen && <div className="backup-backdrop" onMouseDown={(event) => event.target === event.currentTarget && closeBackup()}>
+        <section className="backup-modal" role="dialog" aria-modal="true" aria-labelledby="wallet-backup-title">
+          <div className="backup-heading"><div><small>WALLET SECURITY</small><h2 id="wallet-backup-title">Wallet backup</h2></div><button aria-label="Close wallet backup" onClick={closeBackup}>×</button></div>
+          <p>Your encrypted backup is the safest file to store. It cannot unlock the wallet without your password.</p>
+          <button className="secondary-button backup-download" onClick={downloadBackup}>Download encrypted backup</button>
+          <div className="private-key-panel">
+            <span className="danger-kicker">DANGEROUS</span>
+            <h3>Reveal private key</h3>
+            <p>Anyone who sees this key can take every asset in this wallet. Lockstep decrypts it only in this browser and clears it after 30 seconds.</p>
+            {!revealedPrivateKey ? <>
+              <label className="field-label">WALLET PASSWORD<input type="password" value={backupPassword} onChange={(event) => setBackupPassword(event.target.value)} onKeyDown={(event) => event.key === "Enter" && void revealPrivateKey()} placeholder="Enter your wallet password" autoComplete="current-password" /></label>
+              <label className="backup-confirm"><input type="checkbox" checked={backupAcknowledged} onChange={(event) => setBackupAcknowledged(event.target.checked)} /><span>I understand anyone with this private key controls the wallet.</span></label>
+              {backupError && <p className="form-error">{backupError}</p>}
+              <button className="danger-button" disabled={backupBusy || !backupAcknowledged} onClick={() => void revealPrivateKey()}>{backupBusy ? "Decrypting…" : "Reveal private key"}</button>
+            </> : <>
+              <label className="field-label">BASE58 PRIVATE KEY<div className="revealed-key"><input readOnly type={privateKeyVisible ? "text" : "password"} value={revealedPrivateKey} aria-label="Base58 private key" /><button onClick={() => setPrivateKeyVisible((visible) => !visible)}>{privateKeyVisible ? "Hide" : "Show"}</button></div></label>
+              <div className="private-key-actions"><button className="secondary-button" onClick={() => void copyPrivateKey()}>{privateKeyCopied ? "Copied" : "Copy private key"}</button><button className="secondary-button" onClick={() => { setRevealedPrivateKey(""); setPrivateKeyVisible(false); setPrivateKeyCopied(false); }}>Clear now</button></div>
+              <p className="key-expiry">This key will be removed from the screen automatically after 30 seconds.</p>
+              {backupError && <p className="form-error">{backupError}</p>}
+            </>}
+          </div>
+        </section>
+      </div>}
       {activationOpen && <div className="activation-backdrop"><div className="activation-modal"><span className="activation-icon">▶</span><small>REAL SOL EXECUTION</small><h2>Activate {migrationLiveMode ? "Migration Live" : "New Pairs Live"}?</h2><p>Lockstep will automatically sign real mainnet buys and exits from this dedicated wallet while the tab remains open.</p><div><span>STRATEGY <b>{migrationLiveMode ? "Post-migration rug entries" : "Fresh Pump.fun launches"}</b></span><span>REAL ORDER SIZE <b>{migrationLiveMode ? `${migrationLiveSettings.buyAmount} SOL exact` : `${newPairsSettings.buyAmount} base / ${newPairsSettings.adaptiveBuyAmount} SOL quote-up`}</b></span><span>DAILY LOSS LIMIT <b>{activeSettings.dailyLoss} SOL</b></span></div><label><input type="checkbox" id="risk-confirmation" /> <span>I understand this specific mode uses real SOL and can lose the wallet balance.</span></label><div className="activation-actions"><button className="secondary-button" onClick={() => setActivationOpen(false)}>Cancel</button><button className="primary-button" onClick={() => { const checkbox = document.getElementById("risk-confirmation") as HTMLInputElement | null; if (!checkbox?.checked) return; setEngineMode("active"); setActivationOpen(false); addExecutionActivity(`${migrationLiveMode ? "Migration Live" : "New Pairs Live"} active`, `Real-SOL execution armed for this browser session`, "good"); }}>Activate with real SOL</button></div></div></div>}
     </main>
   );
