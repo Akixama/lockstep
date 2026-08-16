@@ -181,6 +181,25 @@ function executablePaperSellProceeds(grossProceedsSol: number, marketCapUsd: num
   return { proceedsSol: Math.max(0, afterFees), impactPercent, executable: afterFees > 0 };
 }
 
+function describeLiveEntryFailure(rawMessage: string): string {
+  if (/custom.*:\s*1\b/i.test(rawMessage) || /custom program error: 0x1\b/i.test(rawMessage)) {
+    return "price moved past the slippage limit before the order landed on-chain";
+  }
+  if (/confirmation timed out/i.test(rawMessage)) {
+    return "the transaction never confirmed in time, likely network congestion or it was dropped";
+  }
+  if (/could not build transaction/i.test(rawMessage)) {
+    return "the trade builder could not prepare an order for this coin";
+  }
+  if (/insufficient/i.test(rawMessage)) {
+    return "not enough SOL in the wallet for this order";
+  }
+  if (/blockhash/i.test(rawMessage)) {
+    return "the transaction expired before it could land, the network was too slow";
+  }
+  return rawMessage;
+}
+
 function formatUsdMarketCap(value?: number) {
   const marketCap = Number(value);
   if (!Number.isFinite(marketCap) || marketCap <= 0) return "— MC";
@@ -252,6 +271,7 @@ export default function LockstepApp() {
   const paperPollInFlight = useRef(false);
   const processedMigrationMints = useRef(new Set<string>());
   const unstableMarkWarnings = useRef(new Set<string>());
+  const migrationEntryFailureStreak = useRef(0);
   const engineModeRef = useRef<EngineMode>("paused");
   const strategyModeRef = useRef<StrategyMode>("migration-paper");
   const [executionActivity, setExecutionActivity] = useState<ActivityItem[]>([]);
@@ -733,8 +753,7 @@ export default function LockstepApp() {
         const crossedRugTrigger = Number.isFinite(streamedMarketCapUsd)
           && streamedMarketCapUsd >= migrationExecutionSettings.boostEntryMinMarketCapUsd
           && streamedMarketCapUsd <= migrationExecutionSettings.boostEntryMarketCapUsd
-          && hasObservedAboveEntryBand
-          && previousObservedMarketCapUsd > migrationExecutionSettings.boostEntryMarketCapUsd;
+          && hasObservedAboveEntryBand;
         if (streamedMarketCapUsd > migrationExecutionSettings.boostEntryMarketCapUsd) hasObservedAboveEntryBand = true;
         previousObservedMarketCapUsd = streamedMarketCapUsd;
         if (crossedRugTrigger) {
@@ -749,8 +768,7 @@ export default function LockstepApp() {
         const crossedRugTrigger = Number.isFinite(marketCapUsd)
           && marketCapUsd >= migrationExecutionSettings.boostEntryMinMarketCapUsd
           && marketCapUsd <= migrationExecutionSettings.boostEntryMarketCapUsd
-          && hasObservedAboveEntryBand
-          && previousObservedMarketCapUsd > migrationExecutionSettings.boostEntryMarketCapUsd;
+          && hasObservedAboveEntryBand;
         if (marketCapUsd > migrationExecutionSettings.boostEntryMarketCapUsd) hasObservedAboveEntryBand = true;
         if (Number.isFinite(marketCapUsd) && marketCapUsd > 0) previousObservedMarketCapUsd = marketCapUsd;
         if (crossedRugTrigger) {
@@ -770,7 +788,11 @@ export default function LockstepApp() {
     stopTradeWatch?.();
     migrationWatchInFlight.current.delete(candidate.mint);
     if (!triggerCandidate) {
-      if (Date.now() >= watchDeadline) addExecutionActivity(`${candidate.symbol} BOOST watch expired`, `The initial rug did not enter ${rugTriggerLabel} during the five-minute window`, "neutral", candidate.mint);
+      if (Date.now() >= watchDeadline) {
+        addExecutionActivity(`${candidate.symbol} BOOST watch expired`, `The initial rug did not enter ${rugTriggerLabel} during the five-minute window`, "neutral", candidate.mint);
+      } else {
+        addExecutionActivity(`${candidate.symbol} watch cancelled`, `Automation left the active state mid-watch (mode: ${engineModeRef.current}) · this candidate was dropped`, "warn", candidate.mint);
+      }
       return;
     }
     const triggerMarketCapUsd = Number(triggerCandidate.marketCapUsd);
@@ -891,11 +913,21 @@ export default function LockstepApp() {
           },
         };
         setPositions((current) => [livePosition, ...current]);
+        migrationEntryFailureStreak.current = 0;
         addExecutionActivity(`Live bought ${livePosition.symbol}`, `${executableBuyAmount.toFixed(4)} SOL · ${formatUsdMarketCap(livePosition.entryMarketCapUsd)} · ${signature.slice(0, 8)}… · BOOST trigger ${Math.max(0, Math.round((Date.now() - migrationStartedAt) / 1000))}s after migration`, "good", livePosition.mint);
         void refreshBalance();
       } catch (error) {
-        setEngineMode("paused");
-        addExecutionActivity(`Live entry failed: ${candidate.symbol}`, `${error instanceof Error ? error.message : "Transaction failed"} · automation paused`, "warn", candidate.mint);
+        migrationEntryFailureStreak.current += 1;
+        const streak = migrationEntryFailureStreak.current;
+        const rawDetail = error instanceof Error ? error.message : "Transaction failed";
+        const reason = describeLiveEntryFailure(rawDetail);
+        if (streak >= 5) {
+          setEngineMode("paused");
+          migrationEntryFailureStreak.current = 0;
+          addExecutionActivity(`Live entry failed: ${candidate.symbol}`, `${reason} · ${streak} failures in a row, automation paused`, "warn", candidate.mint);
+        } else {
+          addExecutionActivity(`Live entry missed: ${candidate.symbol}`, `${reason} · skipping this coin, still scanning (${streak}/5 recent failures)`, "warn", candidate.mint);
+        }
       } finally {
         liveTradeInFlight.current = false;
       }
