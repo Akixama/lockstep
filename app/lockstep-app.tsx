@@ -246,8 +246,26 @@ export default function LockstepApp() {
   const entryInFlight = useRef(false);
   const liveTradeInFlight = useRef(false);
   const exitInFlight = useRef(new Set<string>());
+  // exitInFlight above is keyed by position.id, which does not stop two
+  // *different* position ids for the *same* mint from selling concurrently.
+  // mintExitInFlight closes that gap: any live sell (full exit or a timed
+  // migration slice) reserves the mint here before doing anything else, so a
+  // second position referencing the same token can never submit a sell while
+  // the first one is still in flight.
+  const mintExitInFlight = useRef(new Set<string>());
   const migrationVerificationInFlight = useRef(new Set<string>());
   const migrationWatchInFlight = useRef(new Set<string>());
+  // liveEntryInFlight closes a race in the live-entry checks below: those
+  // checks read positionsRef.current, which is a ref synced from React state
+  // one render *after* setPositions runs. Two migration events for the same
+  // mint landing close together could both pass that stale check and open two
+  // live positions for one token. This ref is reserved synchronously the
+  // moment a live buy attempt starts, so a second attempt for the same mint
+  // is blocked immediately, no render delay involved. It is only released on
+  // an early-return or a failed buy (so a genuinely failed entry can still be
+  // retried); on a successful buy it stays reserved, since the real position
+  // now guards re-entry anyway and leaving it set costs nothing.
+  const liveEntryInFlight = useRef(new Set<string>());
   const paperExitInFlight = useRef(new Set<string>());
   const paperPollInFlight = useRef(false);
   const processedMigrationMints = useRef(new Set<string>());
@@ -479,9 +497,10 @@ export default function LockstepApp() {
   };
 
   const closeLivePosition = useCallback(async (position: LivePosition, reason: string) => {
-    if (!keypairRef.current || exitInFlight.current.has(position.id) || liveTradeInFlight.current) return;
+    if (!keypairRef.current || exitInFlight.current.has(position.id) || mintExitInFlight.current.has(position.mint) || liveTradeInFlight.current) return;
     liveTradeInFlight.current = true;
     exitInFlight.current.add(position.id);
+    mintExitInFlight.current.add(position.mint);
     setPositions((current) => current.map((item) => item.id === position.id ? { ...item, status: "closing" } : item));
     addExecutionActivity(`Selling ${position.symbol}`, `${reason} · submitting 100% exit`, "neutral", position.mint);
     try {
@@ -501,14 +520,16 @@ export default function LockstepApp() {
       addExecutionActivity(`Exit failed: ${position.symbol}`, describeLiveTradeFailure(rawDetail), "warn", position.mint);
     } finally {
       exitInFlight.current.delete(position.id);
+      mintExitInFlight.current.delete(position.mint);
       liveTradeInFlight.current = false;
     }
   }, [addExecutionActivity, migrationLiveSettings.exitImpact, newPairsSettings.slippage, refreshBalance]);
 
   const sellLiveMigrationSlice = useCallback(async (position: LivePosition) => {
-    if (!keypairRef.current || !position.migrationExitPlan || exitInFlight.current.has(position.id) || liveTradeInFlight.current) return;
+    if (!keypairRef.current || !position.migrationExitPlan || exitInFlight.current.has(position.id) || mintExitInFlight.current.has(position.mint) || liveTradeInFlight.current) return;
     liveTradeInFlight.current = true;
     exitInFlight.current.add(position.id);
+    mintExitInFlight.current.add(position.mint);
     const slicePercent = Math.min(100, Math.max(1, position.migrationExitPlan.slicePercent));
     addExecutionActivity(`Selling ${slicePercent}% remaining: ${position.symbol}`, `Timed migration exit · submitting live mainnet transaction`, "neutral", position.mint);
     try {
@@ -530,6 +551,7 @@ export default function LockstepApp() {
       addExecutionActivity(`Timed exit failed: ${position.symbol}`, `${describeLiveTradeFailure(rawDetail)} · will retry`, "warn", position.mint);
     } finally {
       exitInFlight.current.delete(position.id);
+      mintExitInFlight.current.delete(position.mint);
       liveTradeInFlight.current = false;
     }
   }, [addExecutionActivity, migrationLiveSettings.exitImpact, refreshBalance]);
@@ -871,18 +893,22 @@ export default function LockstepApp() {
     };
 
     if (!paperExecution) {
-      if (positionsRef.current.some((position) => position.mint === candidate.mint)) return;
+      if (liveEntryInFlight.current.has(candidate.mint) || positionsRef.current.some((position) => position.mint === candidate.mint)) return;
+      liveEntryInFlight.current.add(candidate.mint);
       if (positionsRef.current.length >= migrationExecutionSettings.maxPositions) {
+        liveEntryInFlight.current.delete(candidate.mint);
         addExecutionActivity(`${candidate.symbol} migrated`, "Live entry skipped · maximum positions reached", "neutral", candidate.mint);
         return;
       }
       if (realizedPnl <= -migrationExecutionSettings.dailyLoss) {
+        liveEntryInFlight.current.delete(candidate.mint);
         setEngineMode("protect");
         addExecutionActivity("Live loss limit reached", "New real-SOL entries disabled; existing positions remain protected", "warn");
         return;
       }
       const freshBalance = await getBalance(signingKeypair.publicKey.toBase58());
       if (freshBalance < executableBuyAmount + LIVE_WALLET_RESERVE_SOL) {
+        liveEntryInFlight.current.delete(candidate.mint);
         setEngineMode("paused");
         addExecutionActivity("Live migration entry blocked", `Wallet needs at least ${(executableBuyAmount + LIVE_WALLET_RESERVE_SOL).toFixed(4)} SOL for the order and reserve`, "warn", candidate.mint);
         return;
@@ -910,6 +936,7 @@ export default function LockstepApp() {
         addExecutionActivity(`Live bought ${livePosition.symbol}`, `${executableBuyAmount.toFixed(4)} SOL · ${formatUsdMarketCap(livePosition.entryMarketCapUsd)} · ${signature.slice(0, 8)}… · BOOST trigger ${Math.max(0, Math.round((Date.now() - migrationStartedAt) / 1000))}s after migration`, "good", livePosition.mint);
         void refreshBalance();
       } catch (error) {
+        liveEntryInFlight.current.delete(candidate.mint);
         migrationEntryFailureStreak.current += 1;
         const streak = migrationEntryFailureStreak.current;
         const rawDetail = error instanceof Error ? error.message : "Transaction failed";
@@ -922,6 +949,12 @@ export default function LockstepApp() {
           addExecutionActivity(`Live entry missed: ${candidate.symbol}`, `${reason} · skipping this coin, still scanning (${streak}/5 recent failures)`, "warn", candidate.mint);
         }
       } finally {
+        // Deliberately not deleted from liveEntryInFlight here on success: the
+        // position itself (checked above via positionsRef) is now the source
+        // of truth preventing re-entry, and leaving the reservation in place
+        // costs nothing while guaranteeing no overlap even across a stale
+        // positionsRef read. It is only cleared above on the early-return
+        // failure paths, where no position was ever created.
         liveTradeInFlight.current = false;
       }
       return;
