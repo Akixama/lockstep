@@ -737,16 +737,13 @@ export default function LockstepApp() {
     const migrationStartedAt = Date.now() - Math.max(0, migrationAge) * 1000;
     const watchDeadline = migrationStartedAt + MIGRATION_WINDOW_SECONDS * 1000;
     const rugTriggerLabel = `${formatUsdMarketCap(migrationExecutionSettings.boostEntryMinMarketCapUsd)}–${formatUsdMarketCap(migrationExecutionSettings.boostEntryMarketCapUsd)}`;
-    addExecutionActivity(`${candidate.symbol} BOOST watch`, `${watchTokenTrades ? "Live trades + backup polling" : "Backup polling"} for up to ${Math.max(0, Math.ceil((watchDeadline - Date.now()) / 1000))}s · waiting for the coin to enter ${rugTriggerLabel}`, "neutral", candidate.mint);
+    addExecutionActivity(`${candidate.symbol} BOOST watch`, `${watchTokenTrades ? "Live trades + backup polling" : "Backup polling"} for up to ${Math.max(0, Math.ceil((watchDeadline - Date.now()) / 1000))}s · waiting for the initial rug to enter ${rugTriggerLabel}`, "neutral", candidate.mint);
     let triggerCandidate: LaunchCandidate | null = null;
-    // FIX: previously this required an observed price above the range's upper
-    // bound (a "spike then fall back") before an entry inside the range would
-    // trigger — see hasObservedAboveEntryBand in the prior version. That meant
-    // a coin (or a large buy) that rose gradually and settled inside the
-    // configured MC range without ever spiking above it would never trigger
-    // an entry, no matter how much SOL landed on it. Entry now fires on any
-    // observed mark inside [boostEntryMinMarketCapUsd, boostEntryMarketCapUsd],
-    // spike or no spike.
+    let previousObservedMarketCapUsd = Number(candidate.marketCapUsd) > 0
+      ? Number(candidate.marketCapUsd)
+      : candidate.marketCapSol * solUsdPrice;
+    let hasObservedAboveEntryBand = Number.isFinite(previousObservedMarketCapUsd)
+      && previousObservedMarketCapUsd > migrationExecutionSettings.boostEntryMarketCapUsd;
     const streamedMarks: LaunchCandidate[] = [];
     let wakeStreamWait: (() => void) | null = null;
     const stopTradeWatch = watchTokenTrades?.(candidate.mint, (mark) => {
@@ -770,7 +767,10 @@ export default function LockstepApp() {
         const streamedMarketCapUsd = Number(streamedMark.marketCapUsd) > 0 ? Number(streamedMark.marketCapUsd) : streamedMark.marketCapSol * solUsdPrice;
         const crossedRugTrigger = Number.isFinite(streamedMarketCapUsd)
           && streamedMarketCapUsd >= migrationExecutionSettings.boostEntryMinMarketCapUsd
-          && streamedMarketCapUsd <= migrationExecutionSettings.boostEntryMarketCapUsd;
+          && streamedMarketCapUsd <= migrationExecutionSettings.boostEntryMarketCapUsd
+          && hasObservedAboveEntryBand;
+        if (streamedMarketCapUsd > migrationExecutionSettings.boostEntryMarketCapUsd) hasObservedAboveEntryBand = true;
+        previousObservedMarketCapUsd = streamedMarketCapUsd;
         if (crossedRugTrigger) {
           triggerCandidate = { ...candidate, ...streamedMark, marketCapUsd: streamedMarketCapUsd };
           break;
@@ -782,7 +782,10 @@ export default function LockstepApp() {
         const marketCapUsd = Number(mark.marketCapUsd);
         const crossedRugTrigger = Number.isFinite(marketCapUsd)
           && marketCapUsd >= migrationExecutionSettings.boostEntryMinMarketCapUsd
-          && marketCapUsd <= migrationExecutionSettings.boostEntryMarketCapUsd;
+          && marketCapUsd <= migrationExecutionSettings.boostEntryMarketCapUsd
+          && hasObservedAboveEntryBand;
+        if (marketCapUsd > migrationExecutionSettings.boostEntryMarketCapUsd) hasObservedAboveEntryBand = true;
+        if (Number.isFinite(marketCapUsd) && marketCapUsd > 0) previousObservedMarketCapUsd = marketCapUsd;
         if (crossedRugTrigger) {
           triggerCandidate = {
             ...candidate,
@@ -801,7 +804,7 @@ export default function LockstepApp() {
     migrationWatchInFlight.current.delete(candidate.mint);
     if (!triggerCandidate) {
       if (Date.now() >= watchDeadline) {
-        addExecutionActivity(`${candidate.symbol} BOOST watch expired`, `The coin did not enter ${rugTriggerLabel} during the five-minute window`, "neutral", candidate.mint);
+        addExecutionActivity(`${candidate.symbol} BOOST watch expired`, `The initial rug did not enter ${rugTriggerLabel} during the five-minute window`, "neutral", candidate.mint);
       } else {
         addExecutionActivity(`${candidate.symbol} watch cancelled`, `Automation left the active state mid-watch (mode: ${engineModeRef.current}) · this candidate was dropped`, "warn", candidate.mint);
       }
@@ -933,25 +936,53 @@ export default function LockstepApp() {
         addExecutionActivity(`Live bought ${livePosition.symbol}`, `${executableBuyAmount.toFixed(4)} SOL · ${formatUsdMarketCap(livePosition.entryMarketCapUsd)} · ${signature.slice(0, 8)}… · BOOST trigger ${Math.max(0, Math.round((Date.now() - migrationStartedAt) / 1000))}s after migration`, "good", livePosition.mint);
         void refreshBalance();
       } catch (error) {
-        liveEntryInFlight.current.delete(candidate.mint);
-        migrationEntryFailureStreak.current += 1;
-        const streak = migrationEntryFailureStreak.current;
         const rawDetail = error instanceof Error ? error.message : "Transaction failed";
         const reason = describeLiveTradeFailure(rawDetail);
-        if (streak >= 5) {
-          setEngineMode("paused");
+        // A thrown error here does not prove the buy never happened. waitForConfirmation
+        // can time out, or a lagging RPC node can report a stale/wrong signature status,
+        // even after the transaction has already landed and moved SOL out of the wallet.
+        // Writing this off as a plain failure in that case leaves a real position sitting
+        // in the wallet with nothing in Lockstep tracking or ever exiting it. Reconcile
+        // against the actual wallet balance before deciding this was really a failure.
+        let recoveredPosition: LivePosition | null = null;
+        try {
+          const balanceAfterFailure = await getBalance(signingKeypair.publicKey.toBase58());
+          const observedCost = freshBalance - balanceAfterFailure;
+          // A genuinely reverted buy still costs the network + priority fee (a few
+          // thousandths of a SOL at most), never anything close to the real order size.
+          if (observedCost >= executableBuyAmount * 0.9) {
+            recoveredPosition = {
+              ...basePosition,
+              buySignature: "recovered",
+              actualCostSol: observedCost,
+              migrationExitPlan: {
+                slicePercent: Math.min(100, Math.max(1, migrationExecutionSettings.boostSellSlicePercent)),
+                intervalSeconds: Math.max(1, migrationExecutionSettings.boostSellIntervalSeconds),
+                slicesCompleted: 0,
+                nextSliceAt: Date.now() + Math.max(1, migrationExecutionSettings.boostSellIntervalSeconds) * 1000,
+                expiresAt: watchDeadline,
+              },
+            };
+          }
+        } catch { /* balance check unavailable; fall through to the normal failure path below */ }
+        if (recoveredPosition) {
+          setPositions((current) => [recoveredPosition!, ...current]);
           migrationEntryFailureStreak.current = 0;
-          addExecutionActivity(`Live entry failed: ${candidate.symbol}`, `${reason} · ${streak} failures in a row, automation paused`, "warn", candidate.mint);
+          addExecutionActivity(`Live bought ${recoveredPosition.symbol} (recovered)`, `"${reason}" was reported, but the wallet balance confirms the buy actually landed · now tracked and will exit normally`, "good", recoveredPosition.mint);
+          void refreshBalance();
         } else {
-          addExecutionActivity(`Live entry missed: ${candidate.symbol}`, `${reason} · skipping this coin, still scanning (${streak}/5 recent failures)`, "warn", candidate.mint);
+          liveEntryInFlight.current.delete(candidate.mint);
+          migrationEntryFailureStreak.current += 1;
+          const streak = migrationEntryFailureStreak.current;
+          if (streak >= 5) {
+            setEngineMode("paused");
+            migrationEntryFailureStreak.current = 0;
+            addExecutionActivity(`Live entry failed: ${candidate.symbol}`, `${reason} · ${streak} failures in a row, automation paused`, "warn", candidate.mint);
+          } else {
+            addExecutionActivity(`Live entry missed: ${candidate.symbol}`, `${reason} · skipping this coin, still scanning (${streak}/5 recent failures)`, "warn", candidate.mint);
+          }
         }
       } finally {
-        // Deliberately not deleted from liveEntryInFlight here on success: the
-        // position itself (checked above via positionsRef) is now the source
-        // of truth preventing re-entry, and leaving the reservation in place
-        // costs nothing while guaranteeing no overlap even across a stale
-        // positionsRef read. It is only cleared above on the early-return
-        // failure paths, where no position was ever created.
         liveTradeInFlight.current = false;
       }
       return;
@@ -1343,7 +1374,7 @@ export default function LockstepApp() {
             <div className="panel-heading"><div><small>STRATEGY</small><h2>{paperMode ? "Migration Paper Lab" : migrationLiveMode ? "Migration Live" : "New Pairs Live"}</h2></div><button className="text-button" onClick={() => setSettingsOpen(true)}>EDIT</button></div>
             <div className="strategy-switch" role="group" aria-label="Trading strategy"><button className={migrationLiveMode ? "selected danger-edge" : ""} onClick={() => changeStrategy("migration-live")}><b>Migration Live</b><small>Real feed · real SOL</small></button><button className={strategyMode === "new-pairs-live" ? "selected danger-edge" : ""} onClick={() => changeStrategy("new-pairs-live")}><b>New Pairs Live</b><small>Real feed · real SOL</small></button><button className={paperMode ? "selected paper-choice" : "paper-choice"} onClick={() => changeStrategy("migration-paper")}><b>Paper Lab</b><small>Fake SOL · isolated</small></button></div>
             <div className="order-size"><span>{paperMode ? "PAPER ORDER SIZE" : "REAL ORDER SIZE"}</span><b>{strategyMode === "new-pairs-live" ? `${newPairsSettings.buyAmount} → ${newPairsSettings.adaptiveBuyAmount}` : `${activeSettings.buyAmount}`} <small>{paperMode ? "FAKE SOL" : "SOL"}</small></b></div>
-            <div className="strategy-rules"><Rule label="Max positions" value={String(activeSettings.maxPositions)} /><Rule label="Daily loss limit" value={`${activeSettings.dailyLoss} ${paperMode ? "fake SOL" : "SOL"}`} danger />{strategyMode !== "new-pairs-live" ? <><Rule label="Entry" value={`${formatUsdMarketCap(migrationDisplaySettings.boostEntryMinMarketCapUsd)}–${formatUsdMarketCap(migrationDisplaySettings.boostEntryMarketCapUsd)}`} good /><Rule label={paperMode ? "Exact paper order" : "Exact live order"} value={`${migrationDisplaySettings.buyAmount} ${paperMode ? "fake SOL" : "SOL"}`} danger /><Rule label="Buy slippage" value={`${migrationDisplaySettings.slippage}%`} danger /><Rule label="Sell slippage" value={`${migrationDisplaySettings.exitImpact}%`} danger /><Rule label="Timed sell" value={`${migrationDisplaySettings.boostSellSlicePercent}% remaining every ${migrationDisplaySettings.boostSellIntervalSeconds}s`} /><Rule label="Profit exit" value={`+${migrationDisplaySettings.takeProfit}% · sell all`} good /><Rule label="Hard exit" value="5 min after migration" /></> : <><Rule label="Stop loss" value={`−${activeSettings.stopLoss}%`} danger /><Rule label="Quote-up size" value={`${newPairsSettings.adaptiveBuyAmount} SOL`} good /><Rule label="Live impact gate" value={`<${newPairsSettings.maxQuoteImpact}%`} /><Rule label="Take profit" value={`+${activeSettings.takeProfit}%`} good /><Rule label="Maximum hold" value={`${activeSettings.maxHold}s`} /><Rule label="Transaction slippage" value={`${activeSettings.slippage}%`} /></>}</div>
+            <div className="strategy-rules"><Rule label="Max positions" value={String(activeSettings.maxPositions)} /><Rule label="Daily loss limit" value={`${activeSettings.dailyLoss} ${paperMode ? "fake SOL" : "SOL"}`} danger />{strategyMode !== "new-pairs-live" ? <><Rule label="Initial-rug entry" value={`${formatUsdMarketCap(migrationDisplaySettings.boostEntryMinMarketCapUsd)}–${formatUsdMarketCap(migrationDisplaySettings.boostEntryMarketCapUsd)}`} good /><Rule label={paperMode ? "Exact paper order" : "Exact live order"} value={`${migrationDisplaySettings.buyAmount} ${paperMode ? "fake SOL" : "SOL"}`} danger /><Rule label="Buy slippage" value={`${migrationDisplaySettings.slippage}%`} danger /><Rule label="Sell slippage" value={`${migrationDisplaySettings.exitImpact}%`} danger /><Rule label="Timed sell" value={`${migrationDisplaySettings.boostSellSlicePercent}% remaining every ${migrationDisplaySettings.boostSellIntervalSeconds}s`} /><Rule label="Profit exit" value={`+${migrationDisplaySettings.takeProfit}% · sell all`} good /><Rule label="Hard exit" value="5 min after migration" /></> : <><Rule label="Stop loss" value={`−${activeSettings.stopLoss}%`} danger /><Rule label="Quote-up size" value={`${newPairsSettings.adaptiveBuyAmount} SOL`} good /><Rule label="Live impact gate" value={`<${newPairsSettings.maxQuoteImpact}%`} /><Rule label="Take profit" value={`+${activeSettings.takeProfit}%`} good /><Rule label="Maximum hold" value={`${activeSettings.maxHold}s`} /><Rule label="Transaction slippage" value={`${activeSettings.slippage}%`} /></>}</div>
             <div className="browser-note"><i>◉</i><span><b>{paperMode ? "Isolated paper execution" : "Browser-bound real execution"}</b><small>{paperMode ? "No code path in this lab can sign or submit a transaction." : "Keep this tab open and wallet unlocked. Live activation is always confirmed separately."}</small></span></div>
             {paperMode && <button className="refresh-button" onClick={resetPaperWallet}>↻ Reset paper wallet to {migrationSettings.paperStartingBalance.toFixed(2)} fake SOL</button>}
           </aside>
