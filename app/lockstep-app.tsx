@@ -9,7 +9,7 @@ import { gcm } from "@noble/ciphers/aes";
 import { pbkdf2Async } from "@noble/hashes/pbkdf2";
 import { sha256 } from "@noble/hashes/sha256";
 import { utf8ToBytes } from "@noble/hashes/utils";
-import { buildExactPaperBuy, buildSignAndSendTrade, fetchLiveBuyQuote, fetchPumpPrice, openLaunchFeed, openMigrationFeed, verifyMigrationCandidate, type LaunchCandidate, type LivePosition, type TokenTradeWatcher } from "./trading";
+import { buildExactPaperBuy, buildSignAndSendTrade, describeLiveTradeFailure, fetchLiveBuyQuote, fetchPumpPrice, openLaunchFeed, openMigrationFeed, verifyMigrationCandidate, type LaunchCandidate, type LivePosition, type TokenTradeWatcher } from "./trading";
 
 type StoredWallet = {
   version: 1;
@@ -179,28 +179,6 @@ function executablePaperSellProceeds(grossProceedsSol: number, marketCapUsd: num
   const afterImpact = grossProceedsSol * (1 - impactPercent / 100);
   const afterFees = afterImpact * (1 - PAPER_TRADING_FEE_PERCENT / 100) - PAPER_PRIORITY_FEE_SOL;
   return { proceedsSol: Math.max(0, afterFees), impactPercent, executable: afterFees > 0 };
-}
-
-function describeLiveEntryFailure(rawMessage: string): string {
-  if (/custom.*:\s*1\b/i.test(rawMessage) || /custom program error: 0x1\b/i.test(rawMessage)) {
-    return "price moved past the slippage limit before the order landed on-chain";
-  }
-  if (/custom.*:\s*6004\b/i.test(rawMessage)) {
-    return "the pool routing was stale, this coin had already migrated off the bonding curve";
-  }
-  if (/confirmation timed out/i.test(rawMessage)) {
-    return "the transaction never confirmed in time, likely network congestion or it was dropped";
-  }
-  if (/could not build transaction/i.test(rawMessage)) {
-    return "the trade builder could not prepare an order for this coin";
-  }
-  if (/insufficient/i.test(rawMessage)) {
-    return "not enough SOL in the wallet for this order";
-  }
-  if (/blockhash/i.test(rawMessage)) {
-    return "the transaction expired before it could land, the network was too slow";
-  }
-  return rawMessage;
 }
 
 function formatUsdMarketCap(value?: number) {
@@ -519,7 +497,8 @@ export default function LockstepApp() {
       void refreshBalance();
     } catch (caught) {
       setPositions((current) => current.map((item) => item.id === position.id ? { ...item, status: "open" } : item));
-      addExecutionActivity(`Exit failed: ${position.symbol}`, caught instanceof Error ? caught.message : "Transaction failed", "warn", position.mint);
+      const rawDetail = caught instanceof Error ? caught.message : "Transaction failed";
+      addExecutionActivity(`Exit failed: ${position.symbol}`, describeLiveTradeFailure(rawDetail), "warn", position.mint);
     } finally {
       exitInFlight.current.delete(position.id);
       liveTradeInFlight.current = false;
@@ -547,7 +526,8 @@ export default function LockstepApp() {
       addExecutionActivity(`Sold ${slicePercent}% remaining: ${position.symbol}`, `${remainingPercent.toFixed(1)}% of original tokens left · ${pnl >= 0 ? "+" : ""}${pnl.toFixed(4)} SOL · ${signature.slice(0, 8)}…`, pnl >= 0 ? "good" : "warn", position.mint);
       void refreshBalance();
     } catch (caught) {
-      addExecutionActivity(`Timed exit failed: ${position.symbol}`, `${caught instanceof Error ? caught.message : "Transaction failed"} · will retry`, "warn", position.mint);
+      const rawDetail = caught instanceof Error ? caught.message : "Transaction failed";
+      addExecutionActivity(`Timed exit failed: ${position.symbol}`, `${describeLiveTradeFailure(rawDetail)} · will retry`, "warn", position.mint);
     } finally {
       exitInFlight.current.delete(position.id);
       liveTradeInFlight.current = false;
@@ -596,7 +576,7 @@ export default function LockstepApp() {
       void refreshBalance();
     } catch (caught) {
       const rawDetail = caught instanceof Error ? caught.message : "Transaction failed";
-      const reason = describeLiveEntryFailure(rawDetail);
+      const reason = describeLiveTradeFailure(rawDetail);
       if (transactionStarted) {
         newPairsEntryFailureStreak.current += 1;
         const streak = newPairsEntryFailureStreak.current;
@@ -933,7 +913,7 @@ export default function LockstepApp() {
         migrationEntryFailureStreak.current += 1;
         const streak = migrationEntryFailureStreak.current;
         const rawDetail = error instanceof Error ? error.message : "Transaction failed";
-        const reason = describeLiveEntryFailure(rawDetail);
+        const reason = describeLiveTradeFailure(rawDetail);
         if (streak >= 5) {
           setEngineMode("paused");
           migrationEntryFailureStreak.current = 0;

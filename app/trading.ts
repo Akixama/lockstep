@@ -101,7 +101,37 @@ async function rpc(method: string, params: unknown[]) {
   return payload.result;
 }
 
-export async function buildSignAndSendTrade({ keypair, action, mint, amount, slippagePercent, pool }: { keypair: Keypair; action: "buy" | "sell"; mint: string; amount: number | string; slippagePercent: number; pool?: "auto" | "pump" | "pump-amm" }) {
+// PumpPortal's trade-local builder can lag a few seconds behind fresh on-chain
+// state (a brand-new bonding-curve completion or a brand-new PumpSwap pool).
+// A transaction built during that gap targets accounts that no longer (or don't
+// yet) match reality and lands on-chain as Custom:6001/6004.
+function isStalePoolRoutingError(rawMessage: string): boolean {
+  return /custom.*:\s*600[14]\b/i.test(rawMessage);
+}
+
+export function describeLiveTradeFailure(rawMessage: string): string {
+  if (/custom.*:\s*1\b/i.test(rawMessage) || /custom program error: 0x1\b/i.test(rawMessage)) {
+    return "price moved past the slippage limit before the order landed on-chain";
+  }
+  if (isStalePoolRoutingError(rawMessage)) {
+    return "the pool routing was stale, this coin had already migrated off the bonding curve";
+  }
+  if (/confirmation timed out/i.test(rawMessage)) {
+    return "the transaction never confirmed in time, likely network congestion or it was dropped";
+  }
+  if (/could not build transaction/i.test(rawMessage)) {
+    return "the trade builder could not prepare an order for this coin";
+  }
+  if (/insufficient/i.test(rawMessage)) {
+    return "not enough SOL in the wallet for this order";
+  }
+  if (/blockhash/i.test(rawMessage)) {
+    return "the transaction expired before it could land, the network was too slow";
+  }
+  return rawMessage;
+}
+
+async function attemptTrade({ keypair, action, mint, amount, slippagePercent, pool }: { keypair: Keypair; action: "buy" | "sell"; mint: string; amount: number | string; slippagePercent: number; pool: "auto" | "pump" | "pump-amm" }) {
   const response = await fetch("/api/trade", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -113,7 +143,7 @@ export async function buildSignAndSendTrade({ keypair, action, mint, amount, sli
       denominatedInSol: action === "buy" ? "true" : "false",
       slippage: slippagePercent,
       priorityFee: 0.0005,
-      pool: pool ?? "auto",
+      pool,
     }),
   });
   const payload = await response.json();
@@ -125,6 +155,20 @@ export async function buildSignAndSendTrade({ keypair, action, mint, amount, sli
   const signature = await rpc("sendTransaction", [bytesToBase64(transaction.serialize()), { encoding: "base64", skipPreflight: true, maxRetries: 3 }]) as string;
   await waitForConfirmation(signature);
   return signature;
+}
+
+export async function buildSignAndSendTrade({ keypair, action, mint, amount, slippagePercent, pool }: { keypair: Keypair; action: "buy" | "sell"; mint: string; amount: number | string; slippagePercent: number; pool?: "auto" | "pump" | "pump-amm" }) {
+  const requestedPool = pool ?? "auto";
+  try {
+    return await attemptTrade({ keypair, action, mint, amount, slippagePercent, pool: requestedPool });
+  } catch (caught) {
+    const rawMessage = caught instanceof Error ? caught.message : "Transaction failed";
+    // Only worth a one-shot fallback when we forced a specific pool and the
+    // failure looks like stale routing - "auto" already got PumpPortal's best
+    // current guess, so retrying "auto" again would just repeat the same race.
+    if (requestedPool === "auto" || !isStalePoolRoutingError(rawMessage)) throw caught;
+    return await attemptTrade({ keypair, action, mint, amount, slippagePercent, pool: "auto" });
+  }
 }
 
 export async function buildExactPaperBuy({ publicKey, mint, amountSol, slippagePercent }: { publicKey: string; mint: string; amountSol: number; slippagePercent: number }): Promise<PaperBuyBuild> {
