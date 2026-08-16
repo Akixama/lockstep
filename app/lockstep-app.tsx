@@ -270,6 +270,13 @@ export default function LockstepApp() {
   const paperPollInFlight = useRef(false);
   const processedMigrationMints = useRef(new Set<string>());
   const unstableMarkWarnings = useRef(new Set<string>());
+  // The live position poll below used to swallow every fetchPumpPrice failure
+  // silently, so a token whose price never successfully refreshed (a token
+  // pump.fun's API is slow to index right after migration, a transient 502,
+  // etc.) would just sit with Mark MC frozen at Entry MC forever with zero
+  // signal to the user that anything was wrong. This tracks consecutive
+  // failures per mint so a real warning fires instead of silence.
+  const livePriceFailureCounts = useRef(new Map<string, number>());
   const migrationEntryFailureStreak = useRef(0);
   const newPairsEntryFailureStreak = useRef(0);
   const engineModeRef = useRef<EngineMode>("paused");
@@ -1045,9 +1052,23 @@ export default function LockstepApp() {
         if (position.status !== "open") continue;
         try {
           const mark = await fetchPumpPrice(position.mint);
+          livePriceFailureCounts.current.delete(position.mint);
           const updated = { ...position, symbol: mark.symbol?.slice(0, 12) ?? position.symbol, name: mark.name?.slice(0, 32) ?? position.name, currentPriceSol: mark.priceSol, highPriceSol: Math.max(position.highPriceSol, mark.priceSol), currentMarketCapSol: mark.marketCapSol, currentMarketCapUsd: mark.marketCapUsd };
           setPositions((current) => current.map((item) => item.id === position.id ? updated : item));
-          const change = (mark.priceSol / position.entryPriceSol - 1) * 100;
+          // Once a token migrates off the bonding curve, pump.fun's SOL-denominated
+          // fields (market_cap, virtual reserves) can go stale while usd_market_cap
+          // keeps tracking the live PumpSwap pool. Computing return purely from
+          // currentPriceSol/entryPriceSol (both SOL-denominated) against a stale
+          // source is exactly what makes Mark MC and return look frozen at entry for
+          // migration positions. Prefer the USD market cap ratio when both sides are
+          // usable; it degrades safely back to the SOL ratio for new-pair positions,
+          // whose bonding-curve reserves are still actively trading and reliable.
+          const entryMarketCapUsdForChange = Number(position.entryMarketCapUsd);
+          const nextMarketCapUsdForChange = Number(mark.marketCapUsd);
+          const change = Number.isFinite(entryMarketCapUsdForChange) && entryMarketCapUsdForChange > 0
+            && Number.isFinite(nextMarketCapUsdForChange) && nextMarketCapUsdForChange > 0
+            ? (nextMarketCapUsdForChange / entryMarketCapUsdForChange - 1) * 100
+            : (mark.priceSol / position.entryPriceSol - 1) * 100;
           const age = (Date.now() - position.openedAt) / 1000;
           if (engineMode === "paused") continue;
           if (position.source === "migration" && position.migrationExitPlan) {
@@ -1059,13 +1080,23 @@ export default function LockstepApp() {
           if (change <= -newPairsSettings.stopLoss) void closeLivePosition(updated, "Stop loss");
           else if (change >= newPairsSettings.takeProfit) void closeLivePosition(updated, "Take profit");
           else if (age >= newPairsSettings.maxHold) void closeLivePosition(updated, "Time exit");
-        } catch { /* retain the previous mark during a transient failure */ }
+        } catch {
+          // Retain the previous mark during a transient failure, but stop hiding it
+          // when the failures aren't transient. Five misses in a row at this poll's
+          // 2s interval is roughly 10s with no price update, worth a visible warning
+          // rather than a position that just silently stops moving.
+          const nextFailures = (livePriceFailureCounts.current.get(position.mint) ?? 0) + 1;
+          livePriceFailureCounts.current.set(position.mint, nextFailures);
+          if (nextFailures === 5) {
+            addExecutionActivity(`Price feed stuck: ${position.symbol}`, "Five consecutive price fetches failed · Mark MC and return are not updating for this position", "warn", position.mint);
+          }
+        }
       }
     };
     void poll();
     const timer = window.setInterval(() => void poll(), 2_000);
     return () => window.clearInterval(timer);
-  }, [closeLivePosition, engineMode, migrationLiveSettings.takeProfit, newPairsSettings.maxHold, newPairsSettings.stopLoss, newPairsSettings.takeProfit, positions.length, sellLiveMigrationSlice, unlocked]);
+  }, [addExecutionActivity, closeLivePosition, engineMode, migrationLiveSettings.takeProfit, newPairsSettings.maxHold, newPairsSettings.stopLoss, newPairsSettings.takeProfit, positions.length, sellLiveMigrationSlice, unlocked]);
 
   useEffect(() => {
     if (!unlocked || paperPositions.length === 0) return;
@@ -1385,7 +1416,14 @@ export default function LockstepApp() {
           <div className="positions-head"><span>ASSET</span><span>ENTRY MC</span><span>MARK MC</span><span>RETURN</span><span>SIZE</span><span>STATUS</span></div>
           {visiblePositions.length === 0 ? <div className="empty-positions"><span>◇</span><b>{paperMode ? "No fake capital deployed" : "No capital deployed"}</b><p>{engineMode === "active" ? paperMode ? "Waiting for the next real PumpPortal migration." : "Waiting for a live candidate to pass your rules." : "Activate the engine when you are ready to begin."}</p></div> : <div className="position-list">{visiblePositions.map((position) => {
             const paperRatio = paperMarkRatio(position);
-            const change = paperMode && Number.isFinite(paperRatio) ? (paperRatio - 1) * 100 : (position.currentPriceSol / position.entryPriceSol - 1) * 100;
+            const liveEntryUsd = Number(position.entryMarketCapUsd);
+            const liveMarkUsd = Number(position.currentMarketCapUsd);
+            const liveUsdRatioAvailable = Number.isFinite(liveEntryUsd) && liveEntryUsd > 0 && Number.isFinite(liveMarkUsd) && liveMarkUsd > 0;
+            const change = paperMode && Number.isFinite(paperRatio)
+              ? (paperRatio - 1) * 100
+              : liveUsdRatioAvailable
+                ? (liveMarkUsd / liveEntryUsd - 1) * 100
+                : (position.currentPriceSol / position.entryPriceSol - 1) * 100;
             const entryMarketCap = position.entryMarketCapSol ?? position.entryPriceSol * 1_000_000_000;
             const currentMarketCap = position.currentMarketCapSol ?? position.currentPriceSol * 1_000_000_000;
             const displayName = position.name || position.symbol;
