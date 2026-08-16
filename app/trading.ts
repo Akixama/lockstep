@@ -171,6 +171,12 @@ export async function buildSignAndSendTrade({ keypair, action, mint, amount, sli
   }
 }
 
+// FIX: paper simulation now builds against "pump-amm", matching what Migration
+// Live actually forces (see buildSignAndSendTrade calls with pool: "pump-amm"
+// in lockstep-app.tsx). Previously this always used "auto", which never
+// exercises the stale-pool-routing failure mode (Custom:6001/6004) that live
+// migration trades are specifically exposed to. Paper results now reflect the
+// same routing risk live trades face, instead of testing an easier path.
 export async function buildExactPaperBuy({ publicKey, mint, amountSol, slippagePercent }: { publicKey: string; mint: string; amountSol: number; slippagePercent: number }): Promise<PaperBuyBuild> {
   if (!Number.isFinite(amountSol) || amountSol <= 0) throw new Error("Simulation amount is invalid");
   const response = await fetch("/api/trade", {
@@ -184,7 +190,7 @@ export async function buildExactPaperBuy({ publicKey, mint, amountSol, slippageP
       denominatedInSol: "true",
       slippage: slippagePercent,
       priorityFee: 0.0005,
-      pool: "auto",
+      pool: "pump-amm",
     }),
   });
   const payload = await response.json();
@@ -549,4 +555,4 @@ export function openMigrationFeed(
     socket?.close();
     socket = null;
   };
-    }
+}
