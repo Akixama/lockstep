@@ -101,7 +101,7 @@ async function rpc(method: string, params: unknown[]) {
   return payload.result;
 }
 
-export async function buildSignAndSendTrade({ keypair, action, mint, amount, slippagePercent }: { keypair: Keypair; action: "buy" | "sell"; mint: string; amount: number | string; slippagePercent: number }) {
+export async function buildSignAndSendTrade({ keypair, action, mint, amount, slippagePercent, pool }: { keypair: Keypair; action: "buy" | "sell"; mint: string; amount: number | string; slippagePercent: number; pool?: "auto" | "pump" | "pump-amm" }) {
   const response = await fetch("/api/trade", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -113,7 +113,7 @@ export async function buildSignAndSendTrade({ keypair, action, mint, amount, sli
       denominatedInSol: action === "buy" ? "true" : "false",
       slippage: slippagePercent,
       priorityFee: 0.0005,
-      pool: "auto",
+      pool: pool ?? "auto",
     }),
   });
   const payload = await response.json();
@@ -505,4 +505,4 @@ export function openMigrationFeed(
     socket?.close();
     socket = null;
   };
-}
+    }
