@@ -76,6 +76,36 @@ const TOTAL_BONDING_CURVE_FEE_BPS = 125n;
 const PROTOCOL_FEE_BPS = 95n;
 const CREATOR_FEE_BPS = 30n;
 
+// --- Dynamic priority fee -------------------------------------------------
+// Fresh migration entries are a race against other bots for block inclusion.
+// A flat priority fee loses that race whenever network demand rises above
+// the fixed bid. These constants bound a fee that adapts to real recent
+// network competition instead.
+const DEFAULT_PRIORITY_FEE_SOL = 0.0005;
+const MIN_LIVE_PRIORITY_FEE_SOL = 0.0005;
+const MAX_LIVE_PRIORITY_FEE_SOL = 0.02; // hard cap so a fee spike can't eat the order
+const ESTIMATED_COMPUTE_UNITS = 200_000;
+
+async function fetchCompetitivePriorityFeeSol(): Promise<number> {
+  try {
+    const samples = await rpc("getRecentPrioritizationFees", [[]]) as Array<{ prioritizationFee: number }>;
+    const fees = samples
+      .map((sample) => Number(sample.prioritizationFee))
+      .filter((fee) => Number.isFinite(fee) && fee >= 0)
+      .sort((a, b) => a - b);
+    if (fees.length === 0) return DEFAULT_PRIORITY_FEE_SOL;
+    // Bid above the 75th percentile of recent network fees, not the median —
+    // migration entries are a race, being "average" competitive still loses.
+    const p75 = fees[Math.min(fees.length - 1, Math.floor(fees.length * 0.75))];
+    const bidMicroLamportsPerCu = p75 * 2 + 1;
+    const feeSol = (bidMicroLamportsPerCu * ESTIMATED_COMPUTE_UNITS) / 1_000_000 / LAMPORTS_PER_SOL;
+    return Math.min(MAX_LIVE_PRIORITY_FEE_SOL, Math.max(MIN_LIVE_PRIORITY_FEE_SOL, feeSol));
+  } catch {
+    return DEFAULT_PRIORITY_FEE_SOL; // never block a trade because the fee-sampling RPC hiccuped
+  }
+}
+// ---------------------------------------------------------------------------
+
 function ceilDiv(value: bigint, divisor: bigint) {
   return (value + divisor - 1n) / divisor;
 }
@@ -131,7 +161,7 @@ export function describeLiveTradeFailure(rawMessage: string): string {
   return rawMessage;
 }
 
-async function attemptTrade({ keypair, action, mint, amount, slippagePercent, pool }: { keypair: Keypair; action: "buy" | "sell"; mint: string; amount: number | string; slippagePercent: number; pool: "auto" | "pump" | "pump-amm" }) {
+async function attemptTrade({ keypair, action, mint, amount, slippagePercent, pool, priorityFeeSol }: { keypair: Keypair; action: "buy" | "sell"; mint: string; amount: number | string; slippagePercent: number; pool: "auto" | "pump" | "pump-amm"; priorityFeeSol: number }) {
   const response = await fetch("/api/trade", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -142,7 +172,7 @@ async function attemptTrade({ keypair, action, mint, amount, slippagePercent, po
       amount,
       denominatedInSol: action === "buy" ? "true" : "false",
       slippage: slippagePercent,
-      priorityFee: 0.0005,
+      priorityFee: priorityFeeSol,
       pool,
     }),
   });
@@ -159,15 +189,18 @@ async function attemptTrade({ keypair, action, mint, amount, slippagePercent, po
 
 export async function buildSignAndSendTrade({ keypair, action, mint, amount, slippagePercent, pool }: { keypair: Keypair; action: "buy" | "sell"; mint: string; amount: number | string; slippagePercent: number; pool?: "auto" | "pump" | "pump-amm" }) {
   const requestedPool = pool ?? "auto";
+  // Sampled once per trade attempt, right before submission, so the bid
+  // reflects conditions as close to send-time as possible.
+  const priorityFeeSol = await fetchCompetitivePriorityFeeSol();
   try {
-    return await attemptTrade({ keypair, action, mint, amount, slippagePercent, pool: requestedPool });
+    return await attemptTrade({ keypair, action, mint, amount, slippagePercent, pool: requestedPool, priorityFeeSol });
   } catch (caught) {
     const rawMessage = caught instanceof Error ? caught.message : "Transaction failed";
     // Only worth a one-shot fallback when we forced a specific pool and the
     // failure looks like stale routing - "auto" already got PumpPortal's best
     // current guess, so retrying "auto" again would just repeat the same race.
     if (requestedPool === "auto" || !isStalePoolRoutingError(rawMessage)) throw caught;
-    return await attemptTrade({ keypair, action, mint, amount, slippagePercent, pool: "auto" });
+    return await attemptTrade({ keypair, action, mint, amount, slippagePercent, pool: "auto", priorityFeeSol });
   }
 }
 
@@ -177,6 +210,8 @@ export async function buildSignAndSendTrade({ keypair, action, mint, amount, sli
 // exercises the stale-pool-routing failure mode (Custom:6001/6004) that live
 // migration trades are specifically exposed to. Paper results now reflect the
 // same routing risk live trades face, instead of testing an easier path.
+// Priority fee here stays fixed at the default: this build is never submitted
+// on-chain, so there is no race to bid into.
 export async function buildExactPaperBuy({ publicKey, mint, amountSol, slippagePercent }: { publicKey: string; mint: string; amountSol: number; slippagePercent: number }): Promise<PaperBuyBuild> {
   if (!Number.isFinite(amountSol) || amountSol <= 0) throw new Error("Simulation amount is invalid");
   const response = await fetch("/api/trade", {
@@ -189,7 +224,7 @@ export async function buildExactPaperBuy({ publicKey, mint, amountSol, slippageP
       amount: amountSol,
       denominatedInSol: "true",
       slippage: slippagePercent,
-      priorityFee: 0.0005,
+      priorityFee: DEFAULT_PRIORITY_FEE_SOL,
       pool: "pump-amm",
     }),
   });
