@@ -1,6 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
 
-const ALLOWED_METHODS = new Set(["getBalance", "getLatestBlockhash", "getSignatureStatuses", "getTransaction", "sendTransaction"]);
+const ALLOWED_METHODS = new Set([
+  "getBalance",
+  "getLatestBlockhash",
+  "getSignatureStatuses",
+  "getTransaction",
+  "sendTransaction",
+  "getRecentPrioritizationFees",
+]);
+
 const RPC_URLS = [
   process.env.SOLANA_RPC_URL,
   "https://solana-rpc.publicnode.com",
