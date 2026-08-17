@@ -149,6 +149,17 @@ function makeId() {
   return Array.from(crypto.getRandomValues(new Uint8Array(12)), (value) => value.toString(16).padStart(2, "0")).join("");
 }
 
+// Sets like processedMigrationMints never delete on their success path by
+// design (a mint must never be reprocessed once handled), so over a very
+// long-running session they would otherwise grow without bound. This keeps
+// only the most recently seen entries, which is all that dedup actually needs.
+function addBounded(set: Set<string>, value: string, maxSize: number) {
+  set.add(value);
+  if (set.size <= maxSize) return;
+  const oldest = set.values().next().value;
+  if (oldest !== undefined) set.delete(oldest);
+}
+
 function formatMarketCap(valueSol: number, solUsdPrice: number, directUsd?: number) {
   const value = Number.isFinite(directUsd) && Number(directUsd) > 0 ? Number(directUsd) : valueSol * solUsdPrice;
   if (!Number.isFinite(value) || value <= 0) return "— MC";
@@ -729,7 +740,7 @@ export default function LockstepApp() {
     const migrationExecutionSettings = migrationMode === "migration-live" ? migrationLiveSettings : migrationSettings;
     const paperExecution = migrationMode === "migration-paper";
     if (processedMigrationMints.current.has(unverifiedCandidate.mint) || migrationVerificationInFlight.current.has(unverifiedCandidate.mint)) return;
-    processedMigrationMints.current.add(unverifiedCandidate.mint);
+    addBounded(processedMigrationMints.current, unverifiedCandidate.mint, 3000);
     migrationVerificationInFlight.current.add(unverifiedCandidate.mint);
     let candidate: LaunchCandidate;
     let migrationAge = 0;
