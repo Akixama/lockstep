@@ -260,14 +260,27 @@ export async function fetchPumpPrice(mint: string) {
   const reportedMarketCapUsd = Number(coin.usd_market_cap ?? coin.market_cap_usd);
   const poolAddress = [coin.pool_address, coin.raydium_pool, coin.pump_swap_pool, coin.pumpswap_pool]
     .find((value) => typeof value === "string" && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(value)) as string | undefined;
-  const boostMode = typeof coin.boost_mode === "string"
-    ? coin.boost_mode.trim().toUpperCase()
-    : typeof coin.boostMode === "string"
-      ? coin.boostMode.trim().toUpperCase()
-      : "";
+  // FIX: pump.fun does not consistently expose Mayhem status under
+  // boost_mode/boostMode. Legacy tags (e.g. "Mayhem Classic", seen on
+  // BSTONK) can live under a differently-named or differently-cased field,
+  // which previously made isMayhemMode silently evaluate to false and let a
+  // known-Mayhem coin pass verifyMigrationCandidate as a standard migration.
+  // This now checks several plausible field names, then falls back to
+  // scanning the raw API payload text for "mayhem" as a safety net so an
+  // unrecognized field shape still trips the filter instead of passing
+  // through unnoticed.
+  const boostModeRaw = coin.boost_mode ?? coin.boostMode ?? coin.boost_type ?? coin.boostType
+    ?? coin.launch_mode ?? coin.launchMode ?? coin.mode ?? coin.pool_type ?? coin.poolType
+    ?? coin.launchpad ?? coin.launchpad_type ?? "";
+  const boostMode = typeof boostModeRaw === "string" ? boostModeRaw.trim().toUpperCase() : "";
+  let rawPayloadContainsMayhem = false;
+  try {
+    rawPayloadContainsMayhem = JSON.stringify(coin).toLowerCase().includes("mayhem");
+  } catch { /* ignore stringify failures, fall through to field-based checks only */ }
   const isMayhemMode = coin.is_mayhem_mode === true
     || coin.isMayhemMode === true
-    || boostMode.includes("MAYHEM");
+    || boostMode.includes("MAYHEM")
+    || rawPayloadContainsMayhem;
   // Pump.fun can keep a completed, pooled migration at IN_PROGRESS while it is
   // already tradable. Treat NONE as confirmed-standard and IN_PROGRESS as
   // provisionally standard; an affirmative Mayhem signal always wins.
