@@ -1026,9 +1026,17 @@ export default function LockstepApp() {
     addExecutionActivity(`Paper bought ${position.symbol}`, `${executableBuyAmount.toFixed(4)} fake SOL exact order · live transaction build passed · ${formatUsdMarketCap(position.entryMarketCapUsd)} · ${totalExecutionSlippage.toFixed(1)}% modeled entry impact + fees · BOOST trigger ${Math.max(0, Math.round((Date.now() - migrationStartedAt) / 1000))}s after migration`, "good", position.mint);
   }, [addExecutionActivity, migrationLiveSettings, migrationSettings, realizedPnl, refreshBalance, solUsdPrice]);
 
+  const PUMPPORTAL_API_KEY = process.env.NEXT_PUBLIC_PUMPPORTAL_API_KEY ?? "";
+
   useEffect(() => {
     if (!unlocked || engineMode !== "active") return;
-    if (strategyMode === "migration-paper" || strategyMode === "migration-live") return openMigrationFeed((candidate, watchTokenTrades) => void handleMigrationCandidate(candidate, watchTokenTrades), setFeedStatus);
+    if (strategyMode === "migration-paper" || strategyMode === "migration-live") {
+      return openMigrationFeed(
+        (candidate, watchTokenTrades) => void handleMigrationCandidate(candidate, watchTokenTrades),
+        setFeedStatus,
+        PUMPPORTAL_API_KEY
+      );
+    }
     return openLaunchFeed((candidate) => void handleCandidate(candidate), setFeedStatus);
   }, [engineMode, handleCandidate, handleMigrationCandidate, strategyMode, unlocked]);
 
