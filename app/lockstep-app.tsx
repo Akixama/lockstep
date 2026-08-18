@@ -796,9 +796,27 @@ export default function LockstepApp() {
         const crossedRugTrigger = Number.isFinite(streamedMarketCapUsd)
           && streamedMarketCapUsd >= migrationExecutionSettings.boostEntryMinMarketCapUsd
           && streamedMarketCapUsd <= migrationExecutionSettings.boostEntryMarketCapUsd;
+        // FIX: a raw streamed trade frame's market cap is not trusted on its own
+        // anymore. PumpPortal's subscribeTokenTrade frames can carry a stale or
+        // otherwise bogus marketCapSol/marketCapUsd (e.g. a leftover bonding-curve
+        // figure right around migration), which previously could fire a trigger
+        // wildly detached from the token's real price - the execution-time
+        // fetchPumpPrice() call a few lines below would then see the real price,
+        // and the order would blow through slippage and fail. Now a streamed mark
+        // only decides *when* to check; fetchPumpPrice() is the source of truth
+        // for whether the coin is actually in range before a trigger fires.
         if (crossedRugTrigger) {
-          triggerCandidate = { ...candidate, ...streamedMark, marketCapUsd: streamedMarketCapUsd };
-          break;
+          try {
+            const confirmed = await fetchPumpPrice(candidate.mint);
+            const confirmedMarketCapUsd = Number(confirmed.marketCapUsd);
+            const confirmedInRange = Number.isFinite(confirmedMarketCapUsd)
+              && confirmedMarketCapUsd >= migrationExecutionSettings.boostEntryMinMarketCapUsd
+              && confirmedMarketCapUsd <= migrationExecutionSettings.boostEntryMarketCapUsd;
+            if (confirmedInRange) {
+              triggerCandidate = { ...candidate, ...confirmed, marketCapUsd: confirmedMarketCapUsd };
+              break;
+            }
+          } catch { /* confirmation fetch failed; keep watching rather than trust the raw stream mark */ }
         }
         continue;
       }
