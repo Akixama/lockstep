@@ -763,6 +763,13 @@ export default function LockstepApp() {
     const watchDeadline = migrationStartedAt + MIGRATION_WINDOW_SECONDS * 1000;
     const rugTriggerLabel = `${formatUsdMarketCap(migrationExecutionSettings.boostEntryMinMarketCapUsd)}–${formatUsdMarketCap(migrationExecutionSettings.boostEntryMarketCapUsd)}`;
     addExecutionActivity(`${candidate.symbol} BOOST watch`, `${watchTokenTrades ? "Live trades + backup polling" : "Backup polling"} for up to ${Math.max(0, Math.ceil((watchDeadline - Date.now()) / 1000))}s · waiting for the coin to enter ${rugTriggerLabel}`, "neutral", candidate.mint);
+    // LOGGING: every price check this watch performs (stream-confirm or
+    // direct poll, success or failure) is now written to console so a
+    // watch's full price history is searchable in Vercel's function logs by
+    // mint address afterward - previously only the final "expired"/"bought"
+    // outcome was ever recorded anywhere, which made it impossible to tell
+    // "genuinely never entered range" apart from "fetchPumpPrice kept
+    // failing/never got called" after the fact.
     let triggerCandidate: LaunchCandidate | null = null;
     // FIX: previously this required an observed price above the range's upper
     // bound (a "spike then fall back") before an entry inside the range would
@@ -812,11 +819,15 @@ export default function LockstepApp() {
             const confirmedInRange = Number.isFinite(confirmedMarketCapUsd)
               && confirmedMarketCapUsd >= migrationExecutionSettings.boostEntryMinMarketCapUsd
               && confirmedMarketCapUsd <= migrationExecutionSettings.boostEntryMarketCapUsd;
+            console.log(`[BOOST watch] ${candidate.mint} (${candidate.symbol}) stream-confirm: streamMc=${streamedMarketCapUsd} confirmMc=${confirmedMarketCapUsd} inRange=${confirmedInRange} t=${new Date().toISOString()}`);
             if (confirmedInRange) {
               triggerCandidate = { ...candidate, ...confirmed, marketCapUsd: confirmedMarketCapUsd };
               break;
             }
-          } catch { /* confirmation fetch failed; keep watching rather than trust the raw stream mark */ }
+          } catch (err) {
+            console.log(`[BOOST watch] ${candidate.mint} (${candidate.symbol}) stream-confirm FAILED: ${err instanceof Error ? err.message : String(err)} t=${new Date().toISOString()}`);
+            /* confirmation fetch failed; keep watching rather than trust the raw stream mark */
+          }
         }
         continue;
       }
@@ -826,6 +837,7 @@ export default function LockstepApp() {
         const crossedRugTrigger = Number.isFinite(marketCapUsd)
           && marketCapUsd >= migrationExecutionSettings.boostEntryMinMarketCapUsd
           && marketCapUsd <= migrationExecutionSettings.boostEntryMarketCapUsd;
+        console.log(`[BOOST watch] ${candidate.mint} (${candidate.symbol}) poll: mc=${marketCapUsd} inRange=${crossedRugTrigger} t=${new Date().toISOString()}`);
         if (crossedRugTrigger) {
           triggerCandidate = {
             ...candidate,
@@ -837,7 +849,10 @@ export default function LockstepApp() {
           };
           break;
         }
-      } catch { /* keep watching through transient API failures */ }
+      } catch (err) {
+        console.log(`[BOOST watch] ${candidate.mint} (${candidate.symbol}) poll FAILED: ${err instanceof Error ? err.message : String(err)} t=${new Date().toISOString()}`);
+        /* keep watching through transient API failures */
+      }
       await waitForTradeOrFallback();
     }
     stopTradeWatch?.();
