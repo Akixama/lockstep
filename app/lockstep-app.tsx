@@ -77,7 +77,10 @@ const migrationLiveDefaults = {
   paperStartingBalance: 0,
 };
 
-const LIVE_WALLET_RESERVE_SOL = 0.005;
+// Leaves room for the selected priority fee, base fee, token-account rent and
+// PumpSwap account setup. The built transaction gets a second exact funding
+// preflight in trading.ts before anything is submitted.
+const LIVE_WALLET_RESERVE_SOL = 0.015;
 const LIVE_QUOTE_MAX_AGE_MS = 2_000;
 
 function bytesToBase64(bytes: Uint8Array) {
