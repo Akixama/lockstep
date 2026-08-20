@@ -664,7 +664,6 @@ export function openMigrationFeed(
   onStatus: (status: "connecting" | "live" | "error") => void,
 ) {
   const seen = new Set<string>();
-  const tradeListeners = new Map<string, Set<(mark: LaunchCandidate) => void>>();
   let socket: WebSocket | null = null;
   let stopped = false;
   let reconnectTimer: number | null = null;
@@ -674,23 +673,30 @@ export function openMigrationFeed(
     if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(payload));
   };
 
-  // PumpPortal supports per-token trade subscriptions on the same public
-  // websocket as migrations. Keep one shared socket and subscribe only while
-  // a token is inside its five-minute entry window.
+  // Metered token trades are relayed by our server so the funded PumpPortal
+  // key never reaches a visitor's browser. Each watch is short-lived and the
+  // server deduplicates subscriptions across visitors on a warm instance.
   const watchTokenTrades: TokenTradeWatcher = (mint, onTrade) => {
-    const listeners = tradeListeners.get(mint) ?? new Set<(mark: LaunchCandidate) => void>();
-    const firstListener = listeners.size === 0;
-    listeners.add(onTrade);
-    tradeListeners.set(mint, listeners);
-    if (firstListener) send({ method: "subscribeTokenTrade", keys: [mint] });
-    return () => {
-      const current = tradeListeners.get(mint);
-      current?.delete(onTrade);
-      if (!current || current.size === 0) {
-        tradeListeners.delete(mint);
-        send({ method: "unsubscribeTokenTrade", keys: [mint] });
-      }
-    };
+    const stream = new EventSource(`/api/pumpportal-trades?mint=${encodeURIComponent(mint)}`);
+    stream.addEventListener("message", (event) => {
+      try {
+        const data = JSON.parse(String(event.data)) as Record<string, unknown>;
+        const marketCapSol = Number(data.marketCapSol);
+        const marketCapUsd = Number(data.marketCapUsd);
+        if (data.mint !== mint || !Number.isFinite(marketCapSol) || marketCapSol <= 0) return;
+        onTrade({
+          mint,
+          symbol: typeof data.symbol === "string" ? data.symbol : "MIG",
+          name: typeof data.name === "string" ? data.name : "Migrated token",
+          priceSol: marketCapSol / 1_000_000_000,
+          marketCapSol,
+          marketCapUsd: Number.isFinite(marketCapUsd) && marketCapUsd > 0 ? marketCapUsd : undefined,
+          observedAt: Date.now(),
+          observationSource: "trade-stream",
+        });
+      } catch { /* ignore malformed relay frames */ }
+    });
+    return () => stream.close();
   };
 
   const handleMessage = (event: MessageEvent) => {
@@ -698,25 +704,6 @@ export function openMigrationFeed(
       const data = JSON.parse(String(event.data)) as Record<string, unknown>;
       const mint = typeof data.mint === "string" ? data.mint : "";
       if (!mint) return;
-      const listeners = tradeListeners.get(mint);
-      if (listeners?.size) {
-        const marketCapSol = Number(data.marketCapSol);
-        const marketCapUsd = Number(data.marketCapUsd);
-        if (Number.isFinite(marketCapSol) && marketCapSol > 0) {
-          const mark: LaunchCandidate = {
-            mint,
-            symbol: typeof data.symbol === "string" ? data.symbol : "MIG",
-            name: typeof data.name === "string" ? data.name : "Migrated token",
-            priceSol: marketCapSol / 1_000_000_000,
-            marketCapSol,
-            marketCapUsd: Number.isFinite(marketCapUsd) && marketCapUsd > 0 ? marketCapUsd : undefined,
-            observedAt: Date.now(),
-            observationSource: "trade-stream",
-          };
-          listeners.forEach((listener) => listener(mark));
-        }
-        return;
-      }
       const txType = typeof data.txType === "string" ? data.txType.toLowerCase() : "";
       const isMigrationEvent = !txType || /migrat/.test(txType);
       if (!isMigrationEvent || seen.has(mint)) return;
@@ -752,7 +739,6 @@ export function openMigrationFeed(
       reconnectAttempt = 0;
       onStatus("live");
       send({ method: "subscribeMigration" });
-      tradeListeners.forEach((_listeners, mint) => send({ method: "subscribeTokenTrade", keys: [mint] }));
     });
     nextSocket.addEventListener("message", handleMessage);
     nextSocket.addEventListener("error", () => {

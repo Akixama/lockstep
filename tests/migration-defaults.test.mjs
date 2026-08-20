@@ -4,6 +4,8 @@ import test from "node:test";
 
 const sourceUrl = new URL("../app/lockstep-app.tsx", import.meta.url);
 const tradingSourceUrl = new URL("../app/trading.ts", import.meta.url);
+const relayRouteSourceUrl = new URL("../app/api/pumpportal-trades/route.ts", import.meta.url);
+const relaySourceUrl = new URL("../app/api/pumpportal-trades/relay.ts", import.meta.url);
 
 test("Migration Paper starts from its confirmed defaults instead of legacy settings", async () => {
   const source = await readFile(sourceUrl, "utf8");
@@ -52,16 +54,26 @@ test("Migration Paper excludes Mayhem coins before opening a BOOST watch", async
   assert.match(source, /if \(mark\.isMayhemMode\) throw new Error/);
 });
 
-test("Migration feed reuses one websocket for metered token-trade watches", async () => {
+test("Migration feed consumes the protected server relay for metered token trades", async () => {
   const source = await readFile(tradingSourceUrl, "utf8");
+  const routeSource = await readFile(relayRouteSourceUrl, "utf8");
+  const relaySource = await readFile(relaySourceUrl, "utf8");
 
-  assert.match(source, /subscribeTokenTrade/);
-  assert.match(source, /unsubscribeTokenTrade/);
-  assert.match(source, /tradeListeners = new Map/);
+  assert.match(source, /new EventSource\(`\/api\/pumpportal-trades\?mint=/);
+  assert.doesNotMatch(source, /PUMPPORTAL_API_KEY/);
   assert.equal((source.match(/new WebSocket/g) ?? []).length, 2);
   assert.match(source, /const watchTokenTrades: TokenTradeWatcher =/);
   assert.match(source, /observationSource: "trade-stream"/);
-  assert.doesNotMatch(source, /streamKey \?/);
+  assert.match(routeSource, /process\.env\.PUMPPORTAL_API_KEY/);
+  assert.match(routeSource, /MAX_STREAMS_PER_IP/);
+  assert.match(routeSource, /MAX_STARTS_PER_MINUTE/);
+  assert.match(routeSource, /MAX_TRACKED_IPS/);
+  assert.match(routeSource, /text\/event-stream/);
+  assert.match(relaySource, /MAX_ACTIVE_TOKENS/);
+  assert.match(relaySource, /MAX_LISTENERS_PER_TOKEN/);
+  assert.match(relaySource, /subscribeTokenTrade/);
+  assert.match(relaySource, /unsubscribeTokenTrade/);
+  assert.match(relaySource, /lockstepPumpPortalRelay/);
 });
 
 test("Fresh per-token trades trigger immediately and USD market cap falls back to SOL", async () => {
