@@ -191,6 +191,18 @@ export class LiveTradeError extends Error {
   }
 }
 
+export class LiveTradeFundingError extends Error {
+  balanceSol: number;
+  requiredSol: number;
+
+  constructor(balanceSol: number, requiredSol: number, message = "The wallet cannot fund the complete transaction") {
+    super(message);
+    this.name = "LiveTradeFundingError";
+    this.balanceSol = balanceSol;
+    this.requiredSol = requiredSol;
+  }
+}
+
 function tradeErrorText(error: unknown): string {
   if (error instanceof LiveTradeError) {
     return [error.message, stringifyTradeError(error.rawError), ...(error.logs ?? [])].filter(Boolean).join(" · ");
@@ -200,14 +212,17 @@ function tradeErrorText(error: unknown): string {
 
 /** Only confirmed failures are safe to rebuild automatically; a timeout may still land. */
 export function isRetryableLiveTradeFailure(error: unknown): boolean {
+  if (error instanceof LiveTradeFundingError) return false;
   if (!(error instanceof LiveTradeError) || !error.confirmedOnChainFailure) return false;
   const detail = tradeErrorText(error);
-  return /custom.*:\s*1\b/i.test(detail)
-    || /custom program error: 0x1\b/i.test(detail)
-    || /slippage|price.*(moved|impact)|minimum.*out|too little output/i.test(detail);
+  if (/Program 11111111111111111111111111111111 failed: custom program error: 0x1\b/i.test(detail)) return false;
+  return /slippage|price.*(moved|impact)|minimum.*out|too little output/i.test(detail);
 }
 
 export function describeLiveTradeFailure(error: unknown): string {
+  if (error instanceof LiveTradeFundingError) {
+    return `not enough SOL for the complete transaction · balance ${error.balanceSol.toFixed(4)} SOL · deposit to at least ${error.requiredSol.toFixed(4)} SOL`;
+  }
   const rawMessage = tradeErrorText(error);
   const lastProgramLog = error instanceof LiveTradeError && error.logs?.length
     ? error.logs[error.logs.length - 1]?.replace(/^Program log:\s*/i, "").slice(0, 120)
@@ -215,8 +230,11 @@ export function describeLiveTradeFailure(error: unknown): string {
   const diagnostic = error instanceof LiveTradeError
     ? `${error.signature ? ` · tx ${error.signature.slice(0, 12)}…` : ""}${error.attempts > 1 ? ` · ${error.attempts} fresh attempts` : ""}${lastProgramLog ? ` · log: ${lastProgramLog}` : ""}`
     : "";
+  if (/Program 11111111111111111111111111111111 failed: custom program error: 0x1\b/i.test(rawMessage)) {
+    return `the Solana System Program rejected a debit that would make an account balance negative; the wallet did not have enough spendable SOL for the complete transaction${diagnostic}`;
+  }
   if (/custom.*:\s*1\b/i.test(rawMessage) || /custom program error: 0x1\b/i.test(rawMessage)) {
-    return `the program rejected the transaction on-chain (Custom:1, usually a fast price/account-state race)${diagnostic}`;
+    return `the trading program rejected the transaction on-chain (Custom:1)${diagnostic}`;
   }
   if (isStalePoolRoutingError(rawMessage)) {
     return `the pool routing was stale, this coin had already migrated off the bonding curve${diagnostic}`;
@@ -255,6 +273,31 @@ async function attemptTrade({ keypair, action, mint, amount, slippagePercent, po
   if (!response.ok || !payload.transaction) throw new Error(payload.error ?? "Could not build transaction");
   const transaction = VersionedTransaction.deserialize(base64ToBytes(payload.transaction));
   transaction.sign([keypair]);
+  if (action === "buy") {
+    const balanceResult = await rpc("getBalance", [keypair.publicKey.toBase58(), { commitment: "confirmed" }]) as { value?: number };
+    const balanceSol = Number(balanceResult.value ?? 0) / LAMPORTS_PER_SOL;
+    // Covers the exact order, the priority fee selected for this transaction,
+    // base signature fee, token-account rent and a small landing reserve.
+    const requiredSol = Number(amount) + priorityFeeSol + 0.0021 + 0.000005 + 0.001;
+    if (!Number.isFinite(balanceSol) || balanceSol < requiredSol) {
+      throw new LiveTradeFundingError(balanceSol, requiredSol);
+    }
+    // A low-margin PumpSwap wallet gets one read-only simulation. It catches
+    // transaction-specific account creation/rent that a generic reserve cannot
+    // know before PumpPortal builds the transaction, without charging a fee.
+    if (pool === "pump-amm" && balanceSol < Number(amount) + 0.015) {
+      const simulation = await rpc("simulateTransaction", [bytesToBase64(transaction.serialize()), {
+        encoding: "base64",
+        commitment: "processed",
+        sigVerify: true,
+        accounts: { encoding: "base64", addresses: [keypair.publicKey.toBase58()] },
+      }]) as { value?: { err?: unknown; logs?: string[] | null } };
+      const simulationText = [stringifyTradeError(simulation.value?.err), ...(simulation.value?.logs ?? [])].join(" · ");
+      if (/Program 11111111111111111111111111111111 failed: custom program error: 0x1\b/i.test(simulationText)) {
+        throw new LiveTradeFundingError(balanceSol, Number(amount) + 0.015, "The built transaction requires more spendable lamports than this wallet has");
+      }
+    }
+  }
   // Fresh Pump.fun accounts can reach the leader before shared RPC simulation nodes.
   // Submit the signed transaction directly, then verify confirmation below.
   const signature = await rpc("sendTransaction", [bytesToBase64(transaction.serialize()), { encoding: "base64", skipPreflight: true, maxRetries: 3 }]) as string;
