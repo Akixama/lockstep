@@ -100,6 +100,18 @@ test("Live entries rebuild only transactions confirmed failed on-chain", async (
   assert.match(source, /isRetryableLiveTradeFailure\(error\)/);
 });
 
+test("System Program insufficient-funds failures are explained and never retried", async () => {
+  const source = await readFile(sourceUrl, "utf8");
+  const tradingSource = await readFile(tradingSourceUrl, "utf8");
+
+  assert.match(source, /LIVE_WALLET_RESERVE_SOL = 0\.015/);
+  assert.match(tradingSource, /class LiveTradeFundingError extends Error/);
+  assert.match(tradingSource, /simulateTransaction/);
+  assert.match(tradingSource, /if \(error instanceof LiveTradeFundingError\) return false/);
+  assert.match(tradingSource, /Program 11111111111111111111111111111111 failed: custom program error: 0x1/);
+  assert.match(tradingSource, /deposit to at least/);
+});
+
 test("Live priority fee lookup is warmed outside the buy path", async () => {
   const source = await readFile(sourceUrl, "utf8");
   const tradingSource = await readFile(tradingSourceUrl, "utf8");
