@@ -70,8 +70,11 @@ test("Fresh per-token trades trigger immediately and USD market cap falls back t
   assert.match(source, /function marketCapUsdFor/);
   assert.match(source, /marketCapSol \* solUsdPrice/);
   assert.match(source, /triggerCandidate = \{ \.\.\.candidate, \.\.\.streamedMark, marketCapUsd: streamedMarketCapUsd \}/);
-  assert.match(source, /freshStreamTrigger/);
+  assert.match(source, /observationSource: "poll"/);
+  assert.match(source, /freshTrigger/);
+  assert.match(source, /Date\.now\(\) - Number\(triggerCandidate\.observedAt\) <= LIVE_QUOTE_MAX_AGE_MS/);
   assert.doesNotMatch(source, /stream-confirm:/);
+  assert.doesNotMatch(source, /After execution latency/);
 });
 
 test("Wallet backup requires local password confirmation before revealing a private key", async () => {
