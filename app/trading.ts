@@ -16,6 +16,8 @@ export type LaunchCandidate = {
   isMayhemMode?: boolean;
   boostMode?: string;
   isStandardPumpfunMigration?: boolean;
+  observedAt?: number;
+  observationSource?: "trade-stream" | "poll";
 };
 
 export type MigrationVerification = {
@@ -617,11 +619,9 @@ export function openLaunchFeed(onCandidate: (candidate: LaunchCandidate) => void
 export function openMigrationFeed(
   onCandidate: (candidate: LaunchCandidate, watchTokenTrades: TokenTradeWatcher | null) => void,
   onStatus: (status: "connecting" | "live" | "error") => void,
-  apiKey = "",
 ) {
   const seen = new Set<string>();
   const tradeListeners = new Map<string, Set<(mark: LaunchCandidate) => void>>();
-  const streamKey = apiKey.trim();
   let socket: WebSocket | null = null;
   let stopped = false;
   let reconnectTimer: number | null = null;
@@ -631,7 +631,10 @@ export function openMigrationFeed(
     if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(payload));
   };
 
-  const watchTokenTrades: TokenTradeWatcher | null = streamKey ? (mint, onTrade) => {
+  // PumpPortal supports per-token trade subscriptions on the same public
+  // websocket as migrations. Keep one shared socket and subscribe only while
+  // a token is inside its five-minute entry window.
+  const watchTokenTrades: TokenTradeWatcher = (mint, onTrade) => {
     const listeners = tradeListeners.get(mint) ?? new Set<(mark: LaunchCandidate) => void>();
     const firstListener = listeners.size === 0;
     listeners.add(onTrade);
@@ -645,7 +648,7 @@ export function openMigrationFeed(
         send({ method: "unsubscribeTokenTrade", keys: [mint] });
       }
     };
-  } : null;
+  };
 
   const handleMessage = (event: MessageEvent) => {
     try {
@@ -664,6 +667,8 @@ export function openMigrationFeed(
             priceSol: marketCapSol / 1_000_000_000,
             marketCapSol,
             marketCapUsd: Number.isFinite(marketCapUsd) && marketCapUsd > 0 ? marketCapUsd : undefined,
+            observedAt: Date.now(),
+            observationSource: "trade-stream",
           };
           listeners.forEach((listener) => listener(mark));
         }
@@ -697,16 +702,14 @@ export function openMigrationFeed(
   const connect = () => {
     if (stopped) return;
     onStatus("connecting");
-    const nextSocket = new WebSocket(streamKey
-      ? `wss://pumpportal.fun/api/data?api-key=${encodeURIComponent(streamKey)}`
-      : "wss://pumpportal.fun/api/data");
+    const nextSocket = new WebSocket("wss://pumpportal.fun/api/data");
     socket = nextSocket;
     nextSocket.addEventListener("open", () => {
       if (stopped || socket !== nextSocket) return;
       reconnectAttempt = 0;
       onStatus("live");
       send({ method: "subscribeMigration" });
-      if (streamKey) tradeListeners.forEach((_listeners, mint) => send({ method: "subscribeTokenTrade", keys: [mint] }));
+      tradeListeners.forEach((_listeners, mint) => send({ method: "subscribeTokenTrade", keys: [mint] }));
     });
     nextSocket.addEventListener("message", handleMessage);
     nextSocket.addEventListener("error", () => {
