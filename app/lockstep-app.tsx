@@ -775,6 +775,27 @@ export default function LockstepApp() {
     if (processedMigrationMints.current.has(unverifiedCandidate.mint) || migrationVerificationInFlight.current.has(unverifiedCandidate.mint)) return;
     addBounded(processedMigrationMints.current, unverifiedCandidate.mint, 3000);
     migrationVerificationInFlight.current.add(unverifiedCandidate.mint);
+    // Open the per-token stream immediately and buffer frames while the
+    // migration proof is checked. Waiting until verification completed used
+    // to leave a blind spot where the first PumpSwap buys could already move
+    // through the configured entry band.
+    const streamedMarks: LaunchCandidate[] = [];
+    let wakeStreamWait: (() => void) | null = null;
+    const stopTradeWatch = watchTokenTrades?.(unverifiedCandidate.mint, (mark) => {
+      streamedMarks.push(mark);
+      wakeStreamWait?.();
+    });
+    const waitForTradeOrFallback = () => new Promise<void>((resolve) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        wakeStreamWait = null;
+        resolve();
+      };
+      wakeStreamWait = finish;
+      window.setTimeout(finish, MIGRATION_WATCH_POLL_MS);
+    });
     let candidate: LaunchCandidate;
     let migrationAge = 0;
     try {
@@ -785,12 +806,16 @@ export default function LockstepApp() {
       const reason = caught instanceof Error ? caught.message : "verification failed";
       const candidateLabel = unverifiedCandidate.symbol !== "MIG" ? unverifiedCandidate.symbol : shortAddress(unverifiedCandidate.mint);
       addExecutionActivity(`Migration rejected: ${candidateLabel}`, `${reason} · no ${paperExecution ? "fake" : "live"} entry created`, "warn", unverifiedCandidate.mint);
+      stopTradeWatch?.();
       processedMigrationMints.current.delete(unverifiedCandidate.mint);
       migrationVerificationInFlight.current.delete(unverifiedCandidate.mint);
       return;
     }
     migrationVerificationInFlight.current.delete(unverifiedCandidate.mint);
-    if (migrationWatchInFlight.current.has(candidate.mint) || (paperExecution ? paperPositionsRef.current : positionsRef.current).some((position) => position.mint === candidate.mint)) return;
+    if (migrationWatchInFlight.current.has(candidate.mint) || (paperExecution ? paperPositionsRef.current : positionsRef.current).some((position) => position.mint === candidate.mint)) {
+      stopTradeWatch?.();
+      return;
+    }
     migrationWatchInFlight.current.add(candidate.mint);
     const migrationStartedAt = Date.now() - Math.max(0, migrationAge) * 1000;
     const watchDeadline = migrationStartedAt + MIGRATION_WINDOW_SECONDS * 1000;
@@ -812,23 +837,6 @@ export default function LockstepApp() {
     // an entry, no matter how much SOL landed on it. Entry now fires on any
     // observed mark inside [boostEntryMinMarketCapUsd, boostEntryMarketCapUsd],
     // spike or no spike.
-    const streamedMarks: LaunchCandidate[] = [];
-    let wakeStreamWait: (() => void) | null = null;
-    const stopTradeWatch = watchTokenTrades?.(candidate.mint, (mark) => {
-      streamedMarks.push(mark);
-      wakeStreamWait?.();
-    });
-    const waitForTradeOrFallback = () => new Promise<void>((resolve) => {
-      let settled = false;
-      const finish = () => {
-        if (settled) return;
-        settled = true;
-        wakeStreamWait = null;
-        resolve();
-      };
-      wakeStreamWait = finish;
-      window.setTimeout(finish, MIGRATION_WATCH_POLL_MS);
-    });
     while (Date.now() < watchDeadline && engineModeRef.current === "active" && strategyModeRef.current === migrationMode) {
       const streamedMark = streamedMarks.shift();
       if (streamedMark) {

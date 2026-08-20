@@ -61,14 +61,84 @@ function reserveStream(ip: string) {
   };
 }
 
+function persistentRelayConfigured() {
+  return Boolean(process.env.PUMPPORTAL_RELAY_URL?.trim() && process.env.PUMPPORTAL_RELAY_SECRET?.trim());
+}
+
+async function openPersistentRelay(request: NextRequest, mint: string, releaseStream: () => void) {
+  const relayUrl = process.env.PUMPPORTAL_RELAY_URL?.trim();
+  const relaySecret = process.env.PUMPPORTAL_RELAY_SECRET?.trim();
+  if (!relayUrl || !relaySecret) return null;
+
+  try {
+    const upstreamUrl = new URL("/trades", relayUrl);
+    upstreamUrl.searchParams.set("mint", mint);
+    const upstream = await fetch(upstreamUrl, {
+      headers: { authorization: `Bearer ${relaySecret}` },
+      cache: "no-store",
+      signal: request.signal,
+    });
+    if (!upstream.ok || !upstream.body) {
+      await upstream.body?.cancel();
+      return null;
+    }
+
+    const reader = upstream.body.getReader();
+    let released = false;
+    const finish = () => {
+      if (released) return;
+      released = true;
+      releaseStream();
+      void reader.cancel().catch(() => undefined);
+    };
+    request.signal.addEventListener("abort", finish, { once: true });
+    const stream = new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        try {
+          const result = await reader.read();
+          if (result.done) {
+            finish();
+            controller.close();
+            return;
+          }
+          controller.enqueue(result.value);
+        } catch (error) {
+          finish();
+          controller.error(error);
+        }
+      },
+      cancel() {
+        finish();
+      },
+    });
+    return new Response(stream, {
+      headers: {
+        "content-type": "text/event-stream; charset=utf-8",
+        "cache-control": "private, no-store, no-cache, must-revalidate, no-transform",
+        "x-accel-buffering": "no",
+        "x-content-type-options": "nosniff",
+      },
+    });
+  } catch {
+    return null;
+  }
+}
+
 export async function GET(request: NextRequest) {
   const mint = request.nextUrl.searchParams.get("mint") ?? "";
   if (!MINT_PATTERN.test(mint)) return NextResponse.json({ error: "Invalid token" }, { status: 400 });
   if (!sameSiteRequest(request)) return NextResponse.json({ error: "Cross-site access is not allowed" }, { status: 403 });
-  if (!process.env.PUMPPORTAL_API_KEY?.trim()) return NextResponse.json({ error: "Live trade feed is unavailable" }, { status: 503 });
+  if (!persistentRelayConfigured() && !process.env.PUMPPORTAL_API_KEY?.trim()) return NextResponse.json({ error: "Live trade feed is unavailable" }, { status: 503 });
 
   const releaseStream = reserveStream(requestIp(request));
   if (!releaseStream) return NextResponse.json({ error: "Live trade feed is busy; backup polling remains active" }, { status: 429 });
+
+  const persistentRelay = await openPersistentRelay(request, mint, releaseStream);
+  if (persistentRelay) return persistentRelay;
+  if (!process.env.PUMPPORTAL_API_KEY?.trim()) {
+    releaseStream();
+    return NextResponse.json({ error: "Persistent live trade relay is unavailable; backup polling remains active" }, { status: 503 });
+  }
 
   const encoder = new TextEncoder();
   let cleanup = () => releaseStream();

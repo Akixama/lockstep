@@ -6,6 +6,7 @@ const sourceUrl = new URL("../app/lockstep-app.tsx", import.meta.url);
 const tradingSourceUrl = new URL("../app/trading.ts", import.meta.url);
 const relayRouteSourceUrl = new URL("../app/api/pumpportal-trades/route.ts", import.meta.url);
 const relaySourceUrl = new URL("../app/api/pumpportal-trades/relay.ts", import.meta.url);
+const persistentRelaySourceUrl = new URL("../relay/server.mjs", import.meta.url);
 
 test("Migration Paper starts from its confirmed defaults instead of legacy settings", async () => {
   const source = await readFile(sourceUrl, "utf8");
@@ -70,12 +71,28 @@ test("Migration feed consumes the protected server relay for metered token trade
   assert.match(routeSource, /MAX_STARTS_PER_MINUTE/);
   assert.match(routeSource, /MAX_TRACKED_IPS/);
   assert.match(routeSource, /text\/event-stream/);
+  assert.match(routeSource, /process\.env\.PUMPPORTAL_RELAY_URL/);
+  assert.match(routeSource, /process\.env\.PUMPPORTAL_RELAY_SECRET/);
+  assert.match(routeSource, /authorization: `Bearer \$\{relaySecret\}`/);
   assert.match(relaySource, /MAX_ACTIVE_TOKENS/);
   assert.match(relaySource, /MAX_LISTENERS_PER_TOKEN/);
   assert.match(relaySource, /subscribeTokenTrade/);
   assert.match(relaySource, /unsubscribeTokenTrade/);
   assert.match(relaySource, /lockstepPumpPortalRelay/);
   assert.match(relaySource, /pool: typeof data\.pool === "string"/);
+});
+
+test("Persistent relay keeps one protected PumpPortal connection warm", async () => {
+  const source = await readFile(persistentRelaySourceUrl, "utf8");
+
+  assert.match(source, /relay\.start\(\)/);
+  assert.match(source, /subscribeMigration/);
+  assert.match(source, /subscribeTokenTrade/);
+  assert.match(source, /unsubscribeTokenTrade/);
+  assert.match(source, /LOCKSTEP_RELAY_SECRET/);
+  assert.match(source, /timingSafeEqual/);
+  assert.match(source, /url\.pathname === "\/health"/);
+  assert.match(source, /url\.pathname !== "\/trades"/);
 });
 
 test("Fresh per-token trades trigger immediately and USD market cap falls back to SOL", async () => {
@@ -91,6 +108,8 @@ test("Fresh per-token trades trigger immediately and USD market cap falls back t
   assert.match(source, /PumpPortal live trade/);
   assert.match(source, /verified backup poll/);
   assert.match(source, /freshTrigger/);
+  assert.match(source, /watchTokenTrades\?\.\(unverifiedCandidate\.mint/);
+  assert.match(source, /buffer frames while the/);
   assert.match(source, /Date\.now\(\) - Number\(triggerCandidate\.observedAt\) <= LIVE_QUOTE_MAX_AGE_MS/);
   assert.doesNotMatch(source, /stream-confirm:/);
   assert.doesNotMatch(source, /After execution latency/);
