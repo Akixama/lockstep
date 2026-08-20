@@ -59,6 +59,19 @@ test("Migration feed reuses one websocket for metered token-trade watches", asyn
   assert.match(source, /unsubscribeTokenTrade/);
   assert.match(source, /tradeListeners = new Map/);
   assert.equal((source.match(/new WebSocket/g) ?? []).length, 2);
+  assert.match(source, /const watchTokenTrades: TokenTradeWatcher =/);
+  assert.match(source, /observationSource: "trade-stream"/);
+  assert.doesNotMatch(source, /streamKey \\?/);
+});
+
+test("Fresh per-token trades trigger immediately and USD market cap falls back to SOL", async () => {
+  const source = await readFile(sourceUrl, "utf8");
+
+  assert.match(source, /function marketCapUsdFor/);
+  assert.match(source, /marketCapSol \\* solUsdPrice/);
+  assert.match(source, /triggerCandidate = \\{ \\.\\.\\.candidate, \\.\\.\\.streamedMark, marketCapUsd: streamedMarketCapUsd \\}/);
+  assert.match(source, /freshStreamTrigger/);
+  assert.doesNotMatch(source, /stream-confirm:/);
 });
 
 test("Wallet backup requires local password confirmation before revealing a private key", async () => {
