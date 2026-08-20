@@ -7,6 +7,7 @@ const ALLOWED_METHODS = new Set([
   "getTransaction",
   "sendTransaction",
   "getRecentPrioritizationFees",
+  "simulateTransaction",
 ]);
 
 const RPC_URLS = [
