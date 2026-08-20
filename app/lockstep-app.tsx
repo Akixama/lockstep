@@ -850,7 +850,12 @@ export default function LockstepApp() {
       try {
         const mark = await fetchPumpPrice(candidate.mint);
         const marketCapUsd = marketCapUsdFor(mark, solUsdPrice);
-        const crossedRugTrigger = Number.isFinite(marketCapUsd)
+        const confirmedPostMigrationPoll = mark.complete
+          && Boolean(mark.poolAddress)
+          && !mark.isMayhemMode
+          && mark.isStandardPumpfunMigration === true;
+        const crossedRugTrigger = confirmedPostMigrationPoll
+          && Number.isFinite(marketCapUsd)
           && marketCapUsd >= migrationExecutionSettings.boostEntryMinMarketCapUsd
           && marketCapUsd <= migrationExecutionSettings.boostEntryMarketCapUsd;
         console.log(`[BOOST watch] ${candidate.mint} (${candidate.symbol}) poll: mc=${marketCapUsd} inRange=${crossedRugTrigger} t=${new Date().toISOString()}`);
@@ -864,6 +869,7 @@ export default function LockstepApp() {
             marketCapUsd,
             observedAt: mark.quotedAt,
             observationSource: "poll",
+            observationPool: mark.poolAddress,
           };
           break;
         }
@@ -884,6 +890,11 @@ export default function LockstepApp() {
       return;
     }
     const triggerMarketCapUsd = Number(triggerCandidate.marketCapUsd);
+    const triggerSourceLabel = triggerCandidate.observationSource === "trade-stream" ? "PumpPortal live trade" : "verified backup poll";
+    const triggerPoolLabel = triggerCandidate.observationPool
+      ? triggerCandidate.observationPool === "pump-amm" ? "pump-amm" : `pump-amm (${shortAddress(triggerCandidate.observationPool)})`
+      : "verified PumpSwap";
+    const triggerReceipt = `Trigger ${formatUsdMarketCap(triggerMarketCapUsd)} · ${triggerSourceLabel} · pool ${triggerPoolLabel}`;
     // Both websocket trades and completed HTTP polls are valid observations.
     // Re-fetch only after a signal has actually become stale; a duplicate
     // request here was adding enough latency for fast coins to leave the band.
@@ -906,28 +917,28 @@ export default function LockstepApp() {
           isStandardPumpfunMigration: executionMark.isStandardPumpfunMigration,
         };
       } catch {
-        addExecutionActivity(`${paperExecution ? "Paper" : "Live"} entry failed: ${triggerCandidate.symbol}`, `Immediate execution quote was unavailable · no ${paperExecution ? "fake" : "live"} fill`, "warn", triggerCandidate.mint);
+        addExecutionActivity(`${paperExecution ? "Paper" : "Live"} entry failed: ${triggerCandidate.symbol}`, `${triggerReceipt} · immediate execution quote was unavailable · no ${paperExecution ? "fake" : "live"} fill`, "warn", triggerCandidate.mint);
         return;
       }
     }
     const executionMarketCapUsd = marketCapUsdFor(candidate, solUsdPrice);
     if (Date.now() >= watchDeadline) {
-      addExecutionActivity(`${paperExecution ? "Paper" : "Live"} entry missed: ${candidate.symbol}`, "The five-minute post-migration window expired before the immediate quote returned", "warn", candidate.mint);
+      addExecutionActivity(`${paperExecution ? "Paper" : "Live"} entry missed: ${candidate.symbol}`, `${triggerReceipt} · the five-minute post-migration window expired before execution`, "warn", candidate.mint);
       return;
     }
     if (candidate.isMayhemMode || !candidate.isStandardPumpfunMigration || !candidate.mint.endsWith("pump")) {
       addExecutionActivity(
         `${paperExecution ? "Paper" : "Live"} entry rejected: ${candidate.symbol}`,
         candidate.isMayhemMode
-          ? `Mayhem status detected on the immediate entry check · no ${paperExecution ? "fake" : "live"} fill`
-          : `Standard Pump.fun migration mode was not confirmed${candidate.boostMode ? ` (${candidate.boostMode})` : ""} · no ${paperExecution ? "fake" : "live"} fill`,
+          ? `${triggerReceipt} · Mayhem status detected on the immediate entry check · no ${paperExecution ? "fake" : "live"} fill`
+          : `${triggerReceipt} · standard Pump.fun migration mode was not confirmed${candidate.boostMode ? ` (${candidate.boostMode})` : ""} · no ${paperExecution ? "fake" : "live"} fill`,
         "warn",
         candidate.mint,
       );
       return;
     }
     if (!Number.isFinite(executionMarketCapUsd) || executionMarketCapUsd < migrationExecutionSettings.boostEntryMinMarketCapUsd || executionMarketCapUsd > migrationExecutionSettings.boostEntryMarketCapUsd) {
-      addExecutionActivity(`${paperExecution ? "Paper" : "Live"} entry missed: ${candidate.symbol}`, `The stale signal was refreshed at ${formatUsdMarketCap(executionMarketCapUsd)}, outside ${rugTriggerLabel}`, "warn", candidate.mint);
+      addExecutionActivity(`${paperExecution ? "Paper" : "Live"} entry missed: ${candidate.symbol}`, `${triggerReceipt} · stale signal refreshed at ${formatUsdMarketCap(executionMarketCapUsd)}, outside ${rugTriggerLabel}`, "warn", candidate.mint);
       return;
     }
     const adverseMovePercent = Math.max(0, (executionMarketCapUsd / triggerMarketCapUsd - 1) * 100);
@@ -937,7 +948,7 @@ export default function LockstepApp() {
     if (!Number.isFinite(totalExecutionSlippage)) {
       addExecutionActivity(
         `${paperExecution ? "Paper" : "Live"} entry rejected: ${candidate.symbol}`,
-        `Current MC ${formatUsdMarketCap(executionMarketCapUsd)} · liquidity was unavailable for the fixed ${executableBuyAmount.toFixed(4)} SOL paper order`,
+        `${triggerReceipt} · current MC ${formatUsdMarketCap(executionMarketCapUsd)} · liquidity was unavailable for the fixed ${executableBuyAmount.toFixed(4)} SOL paper order`,
         "warn",
         candidate.mint,
       );
@@ -947,7 +958,7 @@ export default function LockstepApp() {
     if (!signingKeypair) {
       addExecutionActivity(
         `${paperExecution ? "Paper" : "Live"} entry rejected: ${candidate.symbol}`,
-        `The wallet was locked before the transaction build · no ${paperExecution ? "fake" : "live"} fill`,
+        `${triggerReceipt} · the wallet was locked before the transaction build · no ${paperExecution ? "fake" : "live"} fill`,
         "warn",
         candidate.mint,
       );
@@ -979,20 +990,20 @@ export default function LockstepApp() {
       liveEntryInFlight.current.add(candidate.mint);
       if (positionsRef.current.length >= migrationExecutionSettings.maxPositions) {
         liveEntryInFlight.current.delete(candidate.mint);
-        addExecutionActivity(`${candidate.symbol} migrated`, "Live entry skipped · maximum positions reached", "neutral", candidate.mint);
+        addExecutionActivity(`${candidate.symbol} migrated`, `${triggerReceipt} · live entry skipped · maximum positions reached`, "neutral", candidate.mint);
         return;
       }
       if (realizedPnl <= -migrationExecutionSettings.dailyLoss) {
         liveEntryInFlight.current.delete(candidate.mint);
         setEngineMode("protect");
-        addExecutionActivity("Live loss limit reached", "New real-SOL entries disabled; existing positions remain protected", "warn");
+        addExecutionActivity("Live loss limit reached", `${triggerReceipt} · new real-SOL entries disabled; existing positions remain protected`, "warn");
         return;
       }
       const freshBalance = await getBalance(signingKeypair.publicKey.toBase58());
       if (freshBalance < executableBuyAmount + LIVE_WALLET_RESERVE_SOL) {
         liveEntryInFlight.current.delete(candidate.mint);
         setEngineMode("paused");
-        addExecutionActivity("Live migration entry blocked", `Wallet needs at least ${(executableBuyAmount + LIVE_WALLET_RESERVE_SOL).toFixed(4)} SOL for the order and reserve`, "warn", candidate.mint);
+        addExecutionActivity("Live migration entry blocked", `${triggerReceipt} · wallet needs at least ${(executableBuyAmount + LIVE_WALLET_RESERVE_SOL).toFixed(4)} SOL for the order and reserve`, "warn", candidate.mint);
         return;
       }
       liveTradeInFlight.current = true;
@@ -1013,6 +1024,8 @@ export default function LockstepApp() {
               const retryMarketCapUsd = marketCapUsdFor(retryMark, solUsdPrice);
               return !retryMark.isMayhemMode
                 && retryMark.isStandardPumpfunMigration === true
+                && retryMark.complete
+                && Boolean(retryMark.poolAddress)
                 && Number.isFinite(retryMarketCapUsd)
                 && retryMarketCapUsd >= migrationExecutionSettings.boostEntryMinMarketCapUsd
                 && retryMarketCapUsd <= migrationExecutionSettings.boostEntryMarketCapUsd;
@@ -1020,7 +1033,7 @@ export default function LockstepApp() {
               return false;
             }
           },
-          onFreshTransactionRetry: (attempt) => addExecutionActivity(`Retrying ${candidate.symbol}`, `Previous transaction was confirmed failed on-chain · rebuilding fresh transaction (${attempt}/3)`, "neutral", candidate.mint),
+          onFreshTransactionRetry: (attempt) => addExecutionActivity(`Retrying ${candidate.symbol}`, `${triggerReceipt} · PumpSwap slippage rejected the previous quote · rebuilding fresh transaction (${attempt}/3)`, "neutral", candidate.mint),
         });
         const balanceAfter = await getChangedBalance(signingKeypair.publicKey.toBase58(), balanceBefore, "lower");
         const actualCostSol = Math.max(executableBuyAmount, balanceBefore - balanceAfter);
@@ -1038,14 +1051,14 @@ export default function LockstepApp() {
         };
         setPositions((current) => [livePosition, ...current]);
         migrationEntryFailureStreak.current = 0;
-        addExecutionActivity(`Live bought ${livePosition.symbol}`, `${executableBuyAmount.toFixed(4)} SOL · ${formatUsdMarketCap(livePosition.entryMarketCapUsd)} · ${signature.slice(0, 8)}… · BOOST trigger ${Math.max(0, Math.round((Date.now() - migrationStartedAt) / 1000))}s after migration`, "good", livePosition.mint);
+        addExecutionActivity(`Live bought ${livePosition.symbol}`, `${triggerReceipt} · bought ${executableBuyAmount.toFixed(4)} SOL at ${formatUsdMarketCap(livePosition.entryMarketCapUsd)} · ${signature.slice(0, 8)}… · ${Math.max(0, Math.round((Date.now() - migrationStartedAt) / 1000))}s after migration`, "good", livePosition.mint);
         void refreshBalance();
       } catch (error) {
         liveEntryInFlight.current.delete(candidate.mint);
         const reason = describeLiveTradeFailure(error);
         if (isRetryableLiveTradeFailure(error)) {
           migrationEntryFailureStreak.current = 0;
-          addExecutionActivity(`Live entry missed: ${candidate.symbol}`, `${reason} · fresh retries exhausted, still scanning`, "warn", candidate.mint);
+          addExecutionActivity(`Live entry missed: ${candidate.symbol}`, `${triggerReceipt} · ${reason} · fresh retries exhausted, still scanning`, "warn", candidate.mint);
           return;
         }
         migrationEntryFailureStreak.current += 1;
@@ -1053,9 +1066,9 @@ export default function LockstepApp() {
         if (streak >= 5) {
           setEngineMode("paused");
           migrationEntryFailureStreak.current = 0;
-          addExecutionActivity(`Live entry failed: ${candidate.symbol}`, `${reason} · ${streak} failures in a row, automation paused`, "warn", candidate.mint);
+          addExecutionActivity(`Live entry failed: ${candidate.symbol}`, `${triggerReceipt} · ${reason} · ${streak} failures in a row, automation paused`, "warn", candidate.mint);
         } else {
-          addExecutionActivity(`Live entry missed: ${candidate.symbol}`, `${reason} · skipping this coin, still scanning (${streak}/5 recent failures)`, "warn", candidate.mint);
+          addExecutionActivity(`Live entry missed: ${candidate.symbol}`, `${triggerReceipt} · ${reason} · skipping this coin, still scanning (${streak}/5 recent failures)`, "warn", candidate.mint);
         }
       } finally {
         // Deliberately not deleted from liveEntryInFlight here on success: the
@@ -1072,7 +1085,7 @@ export default function LockstepApp() {
     try {
       await buildExactPaperBuy({ publicKey: signingKeypair.publicKey.toBase58(), mint: candidate.mint, amountSol: executableBuyAmount, slippagePercent: migrationExecutionSettings.slippage });
     } catch (error) {
-      addExecutionActivity(`Paper entry rejected: ${candidate.symbol}`, `Exact ${executableBuyAmount.toFixed(4)} SOL transaction could not be built by the live trade route · ${error instanceof Error ? error.message : "unknown execution error"} · no fake fill`, "warn", candidate.mint);
+      addExecutionActivity(`Paper entry rejected: ${candidate.symbol}`, `${triggerReceipt} · Exact ${executableBuyAmount.toFixed(4)} SOL transaction could not be built by the live trade route · ${error instanceof Error ? error.message : "unknown execution error"} · no fake fill`, "warn", candidate.mint);
       return;
     }
     if (paperPositionsRef.current.some((position) => position.mint === candidate.mint)) return;

@@ -18,6 +18,7 @@ export type LaunchCandidate = {
   isStandardPumpfunMigration?: boolean;
   observedAt?: number;
   observationSource?: "trade-stream" | "poll";
+  observationPool?: string;
 };
 
 export type MigrationVerification = {
@@ -164,10 +165,20 @@ async function rpc(method: string, params: unknown[]) {
 
 // PumpPortal's trade-local builder can lag a few seconds behind fresh on-chain
 // state (a brand-new bonding-curve completion or a brand-new PumpSwap pool).
+const PUMP_BONDING_CURVE_PROGRAM = "6EF8rrecthR5Dkzon8Nwu78rvF6kCUKqJ4M5uBEwF6P";
+const PUMP_AMM_PROGRAM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA";
+
 // A transaction built during that gap targets accounts that no longer (or don't
-// yet) match reality and lands on-chain as Custom:6001/6004/6005.
+// yet) match reality. Match the bonding-curve program or its explicit messages;
+// PumpSwap uses overlapping numeric Anchor errors with different meanings.
 function isStalePoolRoutingError(rawMessage: string): boolean {
-  return /custom.*:\s*600[145]\b|BondingCurveComplete|stale bonding.?curve|bonding curve (?:is )?complete|liquidity migrated/i.test(rawMessage);
+  return /BondingCurveComplete|stale bonding.?curve|bonding curve (?:is )?complete|liquidity migrated/i.test(rawMessage)
+    || (rawMessage.includes(PUMP_BONDING_CURVE_PROGRAM) && /custom program error: 0x1775\b|Custom"?:\s*6005\b/i.test(rawMessage));
+}
+
+function isPumpSwapSlippageError(rawMessage: string): boolean {
+  return /ExceededSlippage/i.test(rawMessage)
+    || (rawMessage.includes(PUMP_AMM_PROGRAM) && /custom program error: 0x1774\b|Custom"?:\s*6004\b/i.test(rawMessage));
 }
 
 function isPostMigrationTradePool(value: unknown): boolean {
@@ -222,7 +233,7 @@ export function isRetryableLiveTradeFailure(error: unknown): boolean {
   if (!(error instanceof LiveTradeError) || !error.confirmedOnChainFailure) return false;
   const detail = tradeErrorText(error);
   if (/Program 11111111111111111111111111111111 failed: custom program error: 0x1\b/i.test(detail)) return false;
-  return /slippage|price.*(moved|impact)|minimum.*out|too little output/i.test(detail);
+  return isPumpSwapSlippageError(detail) || /slippage|price.*(moved|impact)|minimum.*out|too little output/i.test(detail);
 }
 
 export function describeLiveTradeFailure(error: unknown): string {
@@ -241,6 +252,9 @@ export function describeLiveTradeFailure(error: unknown): string {
   }
   if (/custom.*:\s*1\b/i.test(rawMessage) || /custom program error: 0x1\b/i.test(rawMessage)) {
     return `the trading program rejected the transaction on-chain (Custom:1)${diagnostic}`;
+  }
+  if (isPumpSwapSlippageError(rawMessage)) {
+    return `PumpSwap rejected the fresh quote because executable output moved beyond its slippage limit${diagnostic}`;
   }
   if (isStalePoolRoutingError(rawMessage)) {
     return `the pool routing was stale, this coin had already migrated off the bonding curve${diagnostic}`;
@@ -279,7 +293,7 @@ async function attemptTrade({ keypair, action, mint, amount, slippagePercent, po
   if (!response.ok || !payload.transaction) throw new Error(payload.error ?? "Could not build transaction");
   const transaction = VersionedTransaction.deserialize(base64ToBytes(payload.transaction));
   if (pool === "pump-amm" && transaction.message.staticAccountKeys
-    .some((key) => key.toBase58() === "6EF8rrecthR5Dkzon8Nwu78rvF6kCUKqJ4M5uBEwF6P")) {
+    .some((key) => key.toBase58() === PUMP_BONDING_CURVE_PROGRAM)) {
     throw new Error("The trade builder returned a stale bonding-curve transaction after migration");
   }
   transaction.sign([keypair]);
@@ -349,7 +363,11 @@ export async function buildSignAndSendTrade({ keypair, action, mint, amount, sli
       // the latency-critical path between detecting the rug and submitting.
       return await attemptTrade({ keypair, action, mint, amount, slippagePercent, pool: activePool, priorityFeeSol: getCachedCompetitivePriorityFeeSol() });
     } catch (caught) {
-      const rawMessage = tradeErrorText(caught);
+      // Pump and PumpSwap reuse numeric Anchor error codes. Fetch the program
+      // logs before classification so PumpSwap 6004 becomes a slippage retry,
+      // never a mislabeled bonding-curve routing failure.
+      const classifiedError = caught instanceof LiveTradeError ? await enrichLiveTradeError(caught) : caught;
+      const rawMessage = tradeErrorText(classifiedError);
       if (!routeFallbackUsed && activePool !== "auto" && isStalePoolRoutingError(rawMessage)) {
         routeFallbackUsed = true;
         // Migration orders must stay pinned to PumpSwap. Give the upstream
@@ -360,7 +378,7 @@ export async function buildSignAndSendTrade({ keypair, action, mint, amount, sli
         continue;
       }
       let retryWindowStillValid = true;
-      if (freshRetriesUsed < freshTransactionRetries && isRetryableLiveTradeFailure(caught) && shouldRetryFreshTransaction) {
+      if (freshRetriesUsed < freshTransactionRetries && isRetryableLiveTradeFailure(classifiedError) && shouldRetryFreshTransaction) {
         try {
           retryWindowStillValid = await shouldRetryFreshTransaction();
         } catch {
@@ -368,18 +386,18 @@ export async function buildSignAndSendTrade({ keypair, action, mint, amount, sli
         }
       }
       const canRetry = freshRetriesUsed < freshTransactionRetries
-        && isRetryableLiveTradeFailure(caught)
+        && isRetryableLiveTradeFailure(classifiedError)
         && retryWindowStillValid;
       if (canRetry) {
         freshRetriesUsed += 1;
         onFreshTransactionRetry?.(freshRetriesUsed + 1);
         continue;
       }
-      if (caught instanceof LiveTradeError) {
-        caught.attempts = attempts;
-        throw await enrichLiveTradeError(caught);
+      if (classifiedError instanceof LiveTradeError) {
+        classifiedError.attempts = attempts;
+        throw classifiedError;
       }
-      throw caught;
+      throw classifiedError;
     }
   }
 }
@@ -711,6 +729,7 @@ export function openMigrationFeed(
           marketCapUsd: Number.isFinite(marketCapUsd) && marketCapUsd > 0 ? marketCapUsd : undefined,
           observedAt: Date.now(),
           observationSource: "trade-stream",
+          observationPool: String(data.pool),
         });
       } catch { /* ignore malformed relay frames */ }
     });

@@ -85,6 +85,11 @@ test("Fresh per-token trades trigger immediately and USD market cap falls back t
   assert.match(source, /marketCapSol \* solUsdPrice/);
   assert.match(source, /triggerCandidate = \{ \.\.\.candidate, \.\.\.streamedMark, marketCapUsd: streamedMarketCapUsd \}/);
   assert.match(source, /observationSource: "poll"/);
+  assert.match(source, /confirmedPostMigrationPoll = mark\.complete/);
+  assert.match(source, /Boolean\(mark\.poolAddress\)/);
+  assert.match(source, /triggerReceipt/);
+  assert.match(source, /PumpPortal live trade/);
+  assert.match(source, /verified backup poll/);
   assert.match(source, /freshTrigger/);
   assert.match(source, /Date\.now\(\) - Number\(triggerCandidate\.observedAt\) <= LIVE_QUOTE_MAX_AGE_MS/);
   assert.doesNotMatch(source, /stream-confirm:/);
@@ -132,12 +137,15 @@ test("System Program insufficient-funds failures are explained and never retried
 test("Completed bonding curves are treated as stale pre-migration routes", async () => {
   const source = await readFile(tradingSourceUrl, "utf8");
 
-  assert.match(source, /600\[145\]/);
   assert.match(source, /BondingCurveComplete/);
   assert.match(source, /liquidity migrated/);
   assert.match(source, /6EF8rrecthR5Dkzon8Nwu78rvF6kCUKqJ4M5uBEwF6P/);
   assert.match(source, /transaction\.message\.staticAccountKeys/);
   assert.match(source, /activePool = requestedPool === "pump-amm" \? "pump-amm" : "auto"/);
+  assert.match(source, /isPumpSwapSlippageError/);
+  assert.match(source, /pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA/);
+  assert.match(source, /custom program error: 0x1774/);
+  assert.match(source, /classifiedError = caught instanceof LiveTradeError \? await enrichLiveTradeError\(caught\) : caught/);
 });
 
 test("Live priority fee lookup is warmed outside the buy path", async () => {
