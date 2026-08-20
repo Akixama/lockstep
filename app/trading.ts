@@ -85,6 +85,11 @@ const DEFAULT_PRIORITY_FEE_SOL = 0.0005;
 const MIN_LIVE_PRIORITY_FEE_SOL = 0.0005;
 const MAX_LIVE_PRIORITY_FEE_SOL = 0.02; // hard cap so a fee spike can't eat the order
 const ESTIMATED_COMPUTE_UNITS = 200_000;
+const PRIORITY_FEE_CACHE_MS = 15_000;
+
+let cachedPriorityFeeSol = DEFAULT_PRIORITY_FEE_SOL;
+let priorityFeeExpiresAt = 0;
+let priorityFeeRefresh: Promise<number> | null = null;
 
 async function fetchCompetitivePriorityFeeSol(): Promise<number> {
   try {
@@ -103,6 +108,30 @@ async function fetchCompetitivePriorityFeeSol(): Promise<number> {
   } catch {
     return DEFAULT_PRIORITY_FEE_SOL; // never block a trade because the fee-sampling RPC hiccuped
   }
+}
+
+function refreshCompetitivePriorityFeeSol(): Promise<number> {
+  if (priorityFeeRefresh) return priorityFeeRefresh;
+  priorityFeeRefresh = fetchCompetitivePriorityFeeSol()
+    .then((fee) => {
+      cachedPriorityFeeSol = fee;
+      priorityFeeExpiresAt = Date.now() + PRIORITY_FEE_CACHE_MS;
+      return fee;
+    })
+    .finally(() => {
+      priorityFeeRefresh = null;
+    });
+  return priorityFeeRefresh;
+}
+
+function getCachedCompetitivePriorityFeeSol(): number {
+  if (Date.now() >= priorityFeeExpiresAt) void refreshCompetitivePriorityFeeSol();
+  return cachedPriorityFeeSol;
+}
+
+/** Warm fee data while the scanner is waiting instead of blocking the buy path. */
+export function warmLiveTradePreparation() {
+  void refreshCompetitivePriorityFeeSol();
 }
 // ---------------------------------------------------------------------------
 
@@ -139,12 +168,56 @@ function isStalePoolRoutingError(rawMessage: string): boolean {
   return /custom.*:\s*600[14]\b/i.test(rawMessage);
 }
 
-export function describeLiveTradeFailure(rawMessage: string): string {
+function stringifyTradeError(value: unknown): string {
+  if (typeof value === "string") return value;
+  try { return JSON.stringify(value); } catch { return String(value); }
+}
+
+export class LiveTradeError extends Error {
+  signature?: string;
+  rawError?: unknown;
+  logs?: string[];
+  confirmedOnChainFailure: boolean;
+  attempts = 1;
+
+  constructor(message: string, options: { signature?: string; rawError?: unknown; confirmedOnChainFailure?: boolean } = {}) {
+    super(message);
+    this.name = "LiveTradeError";
+    this.signature = options.signature;
+    this.rawError = options.rawError;
+    this.confirmedOnChainFailure = options.confirmedOnChainFailure ?? false;
+  }
+}
+
+function tradeErrorText(error: unknown): string {
+  if (error instanceof LiveTradeError) {
+    return [error.message, stringifyTradeError(error.rawError), ...(error.logs ?? [])].filter(Boolean).join(" · ");
+  }
+  return error instanceof Error ? error.message : stringifyTradeError(error);
+}
+
+/** Only confirmed failures are safe to rebuild automatically; a timeout may still land. */
+export function isRetryableLiveTradeFailure(error: unknown): boolean {
+  if (!(error instanceof LiveTradeError) || !error.confirmedOnChainFailure) return false;
+  const detail = tradeErrorText(error);
+  return /custom.*:\s*1\b/i.test(detail)
+    || /custom program error: 0x1\b/i.test(detail)
+    || /slippage|price.*(moved|impact)|minimum.*out|too little output/i.test(detail);
+}
+
+export function describeLiveTradeFailure(error: unknown): string {
+  const rawMessage = tradeErrorText(error);
+  const lastProgramLog = error instanceof LiveTradeError && error.logs?.length
+    ? error.logs[error.logs.length - 1]?.replace(/^Program log:\s*/i, "").slice(0, 120)
+    : "";
+  const diagnostic = error instanceof LiveTradeError
+    ? `${error.signature ? ` · tx ${error.signature.slice(0, 12)}…` : ""}${error.attempts > 1 ? ` · ${error.attempts} fresh attempts` : ""}${lastProgramLog ? ` · log: ${lastProgramLog}` : ""}`
+    : "";
   if (/custom.*:\s*1\b/i.test(rawMessage) || /custom program error: 0x1\b/i.test(rawMessage)) {
-    return "price moved past the slippage limit before the order landed on-chain";
+    return `the program rejected the transaction on-chain (Custom:1, usually a fast price/account-state race)${diagnostic}`;
   }
   if (isStalePoolRoutingError(rawMessage)) {
-    return "the pool routing was stale, this coin had already migrated off the bonding curve";
+    return `the pool routing was stale, this coin had already migrated off the bonding curve${diagnostic}`;
   }
   if (/confirmation timed out/i.test(rawMessage)) {
     return "the transaction never confirmed in time, likely network congestion or it was dropped";
@@ -187,20 +260,68 @@ async function attemptTrade({ keypair, action, mint, amount, slippagePercent, po
   return signature;
 }
 
-export async function buildSignAndSendTrade({ keypair, action, mint, amount, slippagePercent, pool }: { keypair: Keypair; action: "buy" | "sell"; mint: string; amount: number | string; slippagePercent: number; pool?: "auto" | "pump" | "pump-amm" }) {
-  const requestedPool = pool ?? "auto";
-  // Sampled once per trade attempt, right before submission, so the bid
-  // reflects conditions as close to send-time as possible.
-  const priorityFeeSol = await fetchCompetitivePriorityFeeSol();
+async function enrichLiveTradeError(error: LiveTradeError) {
+  if (!error.signature) return error;
   try {
-    return await attemptTrade({ keypair, action, mint, amount, slippagePercent, pool: requestedPool, priorityFeeSol });
-  } catch (caught) {
-    const rawMessage = caught instanceof Error ? caught.message : "Transaction failed";
-    // Only worth a one-shot fallback when we forced a specific pool and the
-    // failure looks like stale routing - "auto" already got PumpPortal's best
-    // current guess, so retrying "auto" again would just repeat the same race.
-    if (requestedPool === "auto" || !isStalePoolRoutingError(rawMessage)) throw caught;
-    return await attemptTrade({ keypair, action, mint, amount, slippagePercent, pool: "auto", priorityFeeSol });
+    const transaction = await rpc("getTransaction", [error.signature, { commitment: "confirmed", maxSupportedTransactionVersion: 0 }]) as { meta?: { logMessages?: string[] } } | null;
+    error.logs = transaction?.meta?.logMessages?.slice(-8);
+  } catch {
+    // Diagnostics are best-effort and must never hide the original failure.
+  }
+  return error;
+}
+
+export async function buildSignAndSendTrade({ keypair, action, mint, amount, slippagePercent, pool, freshTransactionRetries = 0, shouldRetryFreshTransaction, onFreshTransactionRetry }: {
+  keypair: Keypair;
+  action: "buy" | "sell";
+  mint: string;
+  amount: number | string;
+  slippagePercent: number;
+  pool?: "auto" | "pump" | "pump-amm";
+  freshTransactionRetries?: number;
+  shouldRetryFreshTransaction?: () => Promise<boolean>;
+  onFreshTransactionRetry?: (attempt: number) => void;
+}) {
+  const requestedPool = pool ?? "auto";
+  let activePool = requestedPool;
+  let routeFallbackUsed = false;
+  let freshRetriesUsed = 0;
+  let attempts = 0;
+  while (true) {
+    attempts += 1;
+    try {
+      // The cache is refreshed in the background; fee lookup is no longer on
+      // the latency-critical path between detecting the rug and submitting.
+      return await attemptTrade({ keypair, action, mint, amount, slippagePercent, pool: activePool, priorityFeeSol: getCachedCompetitivePriorityFeeSol() });
+    } catch (caught) {
+      const rawMessage = tradeErrorText(caught);
+      if (!routeFallbackUsed && activePool !== "auto" && isStalePoolRoutingError(rawMessage)) {
+        routeFallbackUsed = true;
+        activePool = "auto";
+        continue;
+      }
+      let retryWindowStillValid = true;
+      if (freshRetriesUsed < freshTransactionRetries && isRetryableLiveTradeFailure(caught) && shouldRetryFreshTransaction) {
+        try {
+          retryWindowStillValid = await shouldRetryFreshTransaction();
+        } catch {
+          retryWindowStillValid = false;
+        }
+      }
+      const canRetry = freshRetriesUsed < freshTransactionRetries
+        && isRetryableLiveTradeFailure(caught)
+        && retryWindowStillValid;
+      if (canRetry) {
+        freshRetriesUsed += 1;
+        onFreshTransactionRetry?.(freshRetriesUsed + 1);
+        continue;
+      }
+      if (caught instanceof LiveTradeError) {
+        caught.attempts = attempts;
+        throw await enrichLiveTradeError(caught);
+      }
+      throw caught;
+    }
   }
 }
 
@@ -239,11 +360,17 @@ async function waitForConfirmation(signature: string) {
   for (let attempt = 0; attempt < 28; attempt++) {
     const result = await rpc("getSignatureStatuses", [[signature], { searchTransactionHistory: true }]) as { value?: Array<{ confirmationStatus?: string; err?: unknown } | null> };
     const status = result.value?.[0];
-    if (status?.err) throw new Error(`Transaction failed: ${JSON.stringify(status.err)}`);
+    if (status?.err) {
+      throw new LiveTradeError(`Transaction failed on-chain: ${stringifyTradeError(status.err)}`, {
+        signature,
+        rawError: status.err,
+        confirmedOnChainFailure: true,
+      });
+    }
     if (status?.confirmationStatus === "confirmed" || status?.confirmationStatus === "finalized") return;
     await new Promise((resolve) => setTimeout(resolve, 750));
   }
-  throw new Error(`Transaction confirmation timed out: ${signature}`);
+  throw new LiveTradeError(`Transaction confirmation timed out: ${signature}`, { signature });
 }
 
 export async function fetchPumpPrice(mint: string) {

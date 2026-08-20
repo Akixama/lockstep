@@ -70,3 +70,30 @@ test("Wallet backup requires local password confirmation before revealing a priv
   assert.match(source, /30_000/);
   assert.match(source, /setRevealedPrivateKey\(""\)/);
 });
+
+test("Live entries rebuild only transactions confirmed failed on-chain", async () => {
+  const source = await readFile(sourceUrl, "utf8");
+  const tradingSource = await readFile(tradingSourceUrl, "utf8");
+
+  assert.match(tradingSource, /class LiveTradeError extends Error/);
+  assert.match(tradingSource, /confirmedOnChainFailure/);
+  assert.match(tradingSource, /if \(!\(error instanceof LiveTradeError\) \|\| !error\.confirmedOnChainFailure\) return false/);
+  assert.match(tradingSource, /freshTransactionRetries = 0/);
+  assert.match(tradingSource, /shouldRetryFreshTransaction/);
+  assert.match(tradingSource, /getTransaction/);
+  assert.match(tradingSource, /error\.logs = transaction\?\.meta\?\.logMessages/);
+  assert.match(source, /freshTransactionRetries: 2/g);
+  assert.match(source, /fresh retries exhausted, still scanning/g);
+  assert.match(source, /isRetryableLiveTradeFailure\(error\)/);
+});
+
+test("Live priority fee lookup is warmed outside the buy path", async () => {
+  const source = await readFile(sourceUrl, "utf8");
+  const tradingSource = await readFile(tradingSourceUrl, "utf8");
+
+  assert.match(tradingSource, /PRIORITY_FEE_CACHE_MS/);
+  assert.match(tradingSource, /getCachedCompetitivePriorityFeeSol\(\)/);
+  assert.match(tradingSource, /export function warmLiveTradePreparation/);
+  assert.doesNotMatch(tradingSource, /priorityFeeSol = await fetchCompetitivePriorityFeeSol/);
+  assert.match(source, /if \(unlocked\) warmLiveTradePreparation\(\)/);
+});

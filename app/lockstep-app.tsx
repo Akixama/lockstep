@@ -9,7 +9,7 @@ import { gcm } from "@noble/ciphers/aes";
 import { pbkdf2Async } from "@noble/hashes/pbkdf2";
 import { sha256 } from "@noble/hashes/sha256";
 import { utf8ToBytes } from "@noble/hashes/utils";
-import { buildExactPaperBuy, buildSignAndSendTrade, describeLiveTradeFailure, fetchLiveBuyQuote, fetchPumpPrice, openLaunchFeed, openMigrationFeed, verifyMigrationCandidate, type LaunchCandidate, type LivePosition, type TokenTradeWatcher } from "./trading";
+import { buildExactPaperBuy, buildSignAndSendTrade, describeLiveTradeFailure, fetchLiveBuyQuote, fetchPumpPrice, isRetryableLiveTradeFailure, openLaunchFeed, openMigrationFeed, verifyMigrationCandidate, warmLiveTradePreparation, type LaunchCandidate, type LivePosition, type TokenTradeWatcher } from "./trading";
 
 type StoredWallet = {
   version: 1;
@@ -381,6 +381,10 @@ export default function LockstepApp() {
   useEffect(() => { paperPositionsRef.current = paperPositions; }, [paperPositions]);
   useEffect(() => { engineModeRef.current = engineMode; }, [engineMode]);
   useEffect(() => { strategyModeRef.current = strategyMode; }, [strategyMode]);
+
+  useEffect(() => {
+    if (unlocked) warmLiveTradePreparation();
+  }, [unlocked]);
   useEffect(() => { paperCashRef.current = paperCash; }, [paperCash]);
   useEffect(() => { paperRealizedPnlRef.current = paperRealizedPnl; }, [paperRealizedPnl]);
   useEffect(() => { if (hydrated) localStorage.setItem(POSITIONS_KEY, JSON.stringify(positions)); }, [hydrated, positions]);
@@ -613,7 +617,20 @@ export default function LockstepApp() {
       }
       const balanceBefore = freshBalance;
       transactionStarted = true;
-      const signature = await buildSignAndSendTrade({ keypair: keypairRef.current, action: "buy", mint: candidate.mint, amount: quote.amountSol, slippagePercent: newPairsSettings.slippage });
+      const signature = await buildSignAndSendTrade({
+        keypair: keypairRef.current,
+        action: "buy",
+        mint: candidate.mint,
+        amount: quote.amountSol,
+        slippagePercent: newPairsSettings.slippage,
+        freshTransactionRetries: 2,
+        shouldRetryFreshTransaction: async () => {
+          if (engineModeRef.current !== "active" || strategyModeRef.current !== "new-pairs-live" || positionsRef.current.some((position) => position.mint === candidate.mint)) return false;
+          const freshQuote = await fetchLiveBuyQuote(candidate, quote.amountSol);
+          return Date.now() - freshQuote.quotedAt <= LIVE_QUOTE_MAX_AGE_MS && freshQuote.impactPercent < newPairsSettings.maxQuoteImpact;
+        },
+        onFreshTransactionRetry: (attempt) => addExecutionActivity(`Retrying ${candidate.symbol}`, `Previous transaction was confirmed failed on-chain · rebuilding fresh transaction (${attempt}/3)`, "neutral", candidate.mint),
+      });
       const balanceAfter = await getChangedBalance(keypairRef.current.publicKey.toBase58(), balanceBefore, "lower");
       const actualCostSol = Math.max(quote.amountSol, balanceBefore - balanceAfter);
       const position: LivePosition = { id: makeId(), mint: candidate.mint, symbol: candidate.symbol.slice(0, 12), name: candidate.name.slice(0, 32), entryPriceSol: candidate.priceSol, currentPriceSol: candidate.priceSol, highPriceSol: candidate.priceSol, entryMarketCapSol: candidate.marketCapSol, currentMarketCapSol: candidate.marketCapSol, entryMarketCapUsd: candidate.marketCapUsd, currentMarketCapUsd: candidate.marketCapUsd, amountSol: quote.amountSol, actualCostSol, remainingPercent: 100, openedAt: Date.now(), buySignature: signature, status: "open", execution: "live", source: "new-token" };
@@ -622,9 +639,13 @@ export default function LockstepApp() {
       addExecutionActivity(`Bought ${position.symbol}`, `${quote.amountSol} SOL · ${quote.impactPercent.toFixed(1)}% quoted impact · ${signature.slice(0, 8)}…`, "good", position.mint);
       void refreshBalance();
     } catch (caught) {
-      const rawDetail = caught instanceof Error ? caught.message : "Transaction failed";
-      const reason = describeLiveTradeFailure(rawDetail);
+      const reason = describeLiveTradeFailure(caught);
       if (transactionStarted) {
+        if (isRetryableLiveTradeFailure(caught)) {
+          newPairsEntryFailureStreak.current = 0;
+          addExecutionActivity(`Entry missed: ${candidate.symbol}`, `${reason} · fresh retries exhausted, still scanning`, "warn", candidate.mint);
+          return;
+        }
         newPairsEntryFailureStreak.current += 1;
         const streak = newPairsEntryFailureStreak.current;
         if (streak >= 5) {
@@ -971,7 +992,30 @@ export default function LockstepApp() {
       liveTradeInFlight.current = true;
       try {
         const balanceBefore = freshBalance;
-        const signature = await buildSignAndSendTrade({ keypair: signingKeypair, action: "buy", mint: candidate.mint, amount: executableBuyAmount, slippagePercent: migrationExecutionSettings.slippage, pool: "pump-amm" });
+        const signature = await buildSignAndSendTrade({
+          keypair: signingKeypair,
+          action: "buy",
+          mint: candidate.mint,
+          amount: executableBuyAmount,
+          slippagePercent: migrationExecutionSettings.slippage,
+          pool: "pump-amm",
+          freshTransactionRetries: 2,
+          shouldRetryFreshTransaction: async () => {
+            if (Date.now() >= watchDeadline || engineModeRef.current !== "active" || strategyModeRef.current !== migrationMode || positionsRef.current.some((position) => position.mint === candidate.mint)) return false;
+            try {
+              const retryMark = await fetchPumpPrice(candidate.mint);
+              const retryMarketCapUsd = Number(retryMark.marketCapUsd);
+              return !retryMark.isMayhemMode
+                && retryMark.isStandardPumpfunMigration === true
+                && Number.isFinite(retryMarketCapUsd)
+                && retryMarketCapUsd >= migrationExecutionSettings.boostEntryMinMarketCapUsd
+                && retryMarketCapUsd <= migrationExecutionSettings.boostEntryMarketCapUsd;
+            } catch {
+              return false;
+            }
+          },
+          onFreshTransactionRetry: (attempt) => addExecutionActivity(`Retrying ${candidate.symbol}`, `Previous transaction was confirmed failed on-chain · rebuilding fresh transaction (${attempt}/3)`, "neutral", candidate.mint),
+        });
         const balanceAfter = await getChangedBalance(signingKeypair.publicKey.toBase58(), balanceBefore, "lower");
         const actualCostSol = Math.max(executableBuyAmount, balanceBefore - balanceAfter);
         const livePosition: LivePosition = {
@@ -992,10 +1036,14 @@ export default function LockstepApp() {
         void refreshBalance();
       } catch (error) {
         liveEntryInFlight.current.delete(candidate.mint);
+        const reason = describeLiveTradeFailure(error);
+        if (isRetryableLiveTradeFailure(error)) {
+          migrationEntryFailureStreak.current = 0;
+          addExecutionActivity(`Live entry missed: ${candidate.symbol}`, `${reason} · fresh retries exhausted, still scanning`, "warn", candidate.mint);
+          return;
+        }
         migrationEntryFailureStreak.current += 1;
         const streak = migrationEntryFailureStreak.current;
-        const rawDetail = error instanceof Error ? error.message : "Transaction failed";
-        const reason = describeLiveTradeFailure(rawDetail);
         if (streak >= 5) {
           setEngineMode("paused");
           migrationEntryFailureStreak.current = 0;
@@ -1059,15 +1107,12 @@ export default function LockstepApp() {
     addExecutionActivity(`Paper bought ${position.symbol}`, `${executableBuyAmount.toFixed(4)} fake SOL exact order · live transaction build passed · ${formatUsdMarketCap(position.entryMarketCapUsd)} · ${totalExecutionSlippage.toFixed(1)}% modeled entry impact + fees · BOOST trigger ${Math.max(0, Math.round((Date.now() - migrationStartedAt) / 1000))}s after migration`, "good", position.mint);
   }, [addExecutionActivity, migrationLiveSettings, migrationSettings, realizedPnl, refreshBalance, solUsdPrice]);
 
-  const PUMPPORTAL_API_KEY = process.env.NEXT_PUBLIC_PUMPPORTAL_API_KEY ?? "";
-
   useEffect(() => {
     if (!unlocked || engineMode !== "active") return;
     if (strategyMode === "migration-paper" || strategyMode === "migration-live") {
       return openMigrationFeed(
         (candidate, watchTokenTrades) => void handleMigrationCandidate(candidate, watchTokenTrades),
-        setFeedStatus,
-        PUMPPORTAL_API_KEY
+        setFeedStatus
       );
     }
     return openLaunchFeed((candidate) => void handleCandidate(candidate), setFeedStatus);
