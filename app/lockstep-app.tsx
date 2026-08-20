@@ -862,6 +862,8 @@ export default function LockstepApp() {
             priceSol: mark.priceSol,
             marketCapSol: mark.marketCapSol,
             marketCapUsd,
+            observedAt: mark.quotedAt,
+            observationSource: "poll",
           };
           break;
         }
@@ -882,9 +884,12 @@ export default function LockstepApp() {
       return;
     }
     const triggerMarketCapUsd = Number(triggerCandidate.marketCapUsd);
-    const freshStreamTrigger = triggerCandidate.observationSource === "trade-stream"
-      && Date.now() - Number(triggerCandidate.observedAt) <= 2_000;
-    if (freshStreamTrigger) {
+    // Both websocket trades and completed HTTP polls are valid observations.
+    // Re-fetch only after a signal has actually become stale; a duplicate
+    // request here was adding enough latency for fast coins to leave the band.
+    const freshTrigger = Number.isFinite(triggerCandidate.observedAt)
+      && Date.now() - Number(triggerCandidate.observedAt) <= LIVE_QUOTE_MAX_AGE_MS;
+    if (freshTrigger) {
       candidate = triggerCandidate;
     } else {
       try {
@@ -922,7 +927,7 @@ export default function LockstepApp() {
       return;
     }
     if (!Number.isFinite(executionMarketCapUsd) || executionMarketCapUsd < migrationExecutionSettings.boostEntryMinMarketCapUsd || executionMarketCapUsd > migrationExecutionSettings.boostEntryMarketCapUsd) {
-      addExecutionActivity(`${paperExecution ? "Paper" : "Live"} entry missed: ${candidate.symbol}`, `After execution latency, market cap moved to ${formatUsdMarketCap(executionMarketCapUsd)} outside ${rugTriggerLabel}`, "warn", candidate.mint);
+      addExecutionActivity(`${paperExecution ? "Paper" : "Live"} entry missed: ${candidate.symbol}`, `The stale signal was refreshed at ${formatUsdMarketCap(executionMarketCapUsd)}, outside ${rugTriggerLabel}`, "warn", candidate.mint);
       return;
     }
     const adverseMovePercent = Math.max(0, (executionMarketCapUsd / triggerMarketCapUsd - 1) * 100);
