@@ -165,9 +165,15 @@ async function rpc(method: string, params: unknown[]) {
 // PumpPortal's trade-local builder can lag a few seconds behind fresh on-chain
 // state (a brand-new bonding-curve completion or a brand-new PumpSwap pool).
 // A transaction built during that gap targets accounts that no longer (or don't
-// yet) match reality and lands on-chain as Custom:6001/6004.
+// yet) match reality and lands on-chain as Custom:6001/6004/6005.
 function isStalePoolRoutingError(rawMessage: string): boolean {
-  return /custom.*:\s*600[14]\b/i.test(rawMessage);
+  return /custom.*:\s*600[145]\b|BondingCurveComplete|stale bonding.?curve|bonding curve (?:is )?complete|liquidity migrated/i.test(rawMessage);
+}
+
+function isPostMigrationTradePool(value: unknown): boolean {
+  if (typeof value !== "string") return false;
+  const pool = value.trim().toLowerCase().replace(/[\s_]+/g, "-");
+  return pool === "pump-amm" || pool === "pump-swap" || pool === "pumpswap";
 }
 
 function stringifyTradeError(value: unknown): string {
@@ -272,6 +278,10 @@ async function attemptTrade({ keypair, action, mint, amount, slippagePercent, po
   const payload = await response.json();
   if (!response.ok || !payload.transaction) throw new Error(payload.error ?? "Could not build transaction");
   const transaction = VersionedTransaction.deserialize(base64ToBytes(payload.transaction));
+  if (pool === "pump-amm" && transaction.message.staticAccountKeys
+    .some((key) => key.toBase58() === "6EF8rrecthR5Dkzon8Nwu78rvF6kCUKqJ4M5uBEwF6P")) {
+    throw new Error("The trade builder returned a stale bonding-curve transaction after migration");
+  }
   transaction.sign([keypair]);
   if (action === "buy") {
     const balanceResult = await rpc("getBalance", [keypair.publicKey.toBase58(), { commitment: "confirmed" }]) as { value?: number };
@@ -342,7 +352,11 @@ export async function buildSignAndSendTrade({ keypair, action, mint, amount, sli
       const rawMessage = tradeErrorText(caught);
       if (!routeFallbackUsed && activePool !== "auto" && isStalePoolRoutingError(rawMessage)) {
         routeFallbackUsed = true;
-        activePool = "auto";
+        // Migration orders must stay pinned to PumpSwap. Give the upstream
+        // index a moment to catch up, then rebuild without ever submitting a
+        // transaction that references the completed bonding-curve program.
+        activePool = requestedPool === "pump-amm" ? "pump-amm" : "auto";
+        if (activePool === "pump-amm") await new Promise((resolve) => setTimeout(resolve, 150));
         continue;
       }
       let retryWindowStillValid = true;
@@ -683,7 +697,11 @@ export function openMigrationFeed(
         const data = JSON.parse(String(event.data)) as Record<string, unknown>;
         const marketCapSol = Number(data.marketCapSol);
         const marketCapUsd = Number(data.marketCapUsd);
-        if (data.mint !== mint || !Number.isFinite(marketCapSol) || marketCapSol <= 0) return;
+        // subscribeTokenTrade covers every venue for a mint. Migration mode
+        // must never react to bonding-curve trades, including frames queued
+        // around the exact moment the curve completes.
+        if (data.mint !== mint || !isPostMigrationTradePool(data.pool)
+          || !Number.isFinite(marketCapSol) || marketCapSol <= 0) return;
         onTrade({
           mint,
           symbol: typeof data.symbol === "string" ? data.symbol : "MIG",

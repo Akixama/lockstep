@@ -63,6 +63,7 @@ test("Migration feed consumes the protected server relay for metered token trade
   assert.doesNotMatch(source, /PUMPPORTAL_API_KEY/);
   assert.equal((source.match(/new WebSocket/g) ?? []).length, 2);
   assert.match(source, /const watchTokenTrades: TokenTradeWatcher =/);
+  assert.match(source, /isPostMigrationTradePool\(data\.pool\)/);
   assert.match(source, /observationSource: "trade-stream"/);
   assert.match(routeSource, /process\.env\.PUMPPORTAL_API_KEY/);
   assert.match(routeSource, /MAX_STREAMS_PER_IP/);
@@ -74,6 +75,7 @@ test("Migration feed consumes the protected server relay for metered token trade
   assert.match(relaySource, /subscribeTokenTrade/);
   assert.match(relaySource, /unsubscribeTokenTrade/);
   assert.match(relaySource, /lockstepPumpPortalRelay/);
+  assert.match(relaySource, /pool: typeof data\.pool === "string"/);
 });
 
 test("Fresh per-token trades trigger immediately and USD market cap falls back to SOL", async () => {
@@ -125,6 +127,17 @@ test("System Program insufficient-funds failures are explained and never retried
   assert.match(tradingSource, /if \(error instanceof LiveTradeFundingError\) return false/);
   assert.match(tradingSource, /Program 11111111111111111111111111111111 failed: custom program error: 0x1/);
   assert.match(tradingSource, /deposit to at least/);
+});
+
+test("Completed bonding curves are treated as stale pre-migration routes", async () => {
+  const source = await readFile(tradingSourceUrl, "utf8");
+
+  assert.match(source, /600\[145\]/);
+  assert.match(source, /BondingCurveComplete/);
+  assert.match(source, /liquidity migrated/);
+  assert.match(source, /6EF8rrecthR5Dkzon8Nwu78rvF6kCUKqJ4M5uBEwF6P/);
+  assert.match(source, /transaction\.message\.staticAccountKeys/);
+  assert.match(source, /activePool = requestedPool === "pump-amm" \? "pump-amm" : "auto"/);
 });
 
 test("Live priority fee lookup is warmed outside the buy path", async () => {

@@ -4,6 +4,7 @@ type TradeFrame = {
   marketCapUsd?: number;
   symbol?: string;
   name?: string;
+  pool?: string;
 };
 
 type TradeListener = (frame: TradeFrame) => void;
@@ -97,6 +98,7 @@ class PumpPortalRelay {
         marketCapUsd: Number.isFinite(marketCapUsd) && marketCapUsd > 0 ? marketCapUsd : undefined,
         symbol: typeof data.symbol === "string" ? data.symbol.slice(0, 24) : undefined,
         name: typeof data.name === "string" ? data.name.slice(0, 80) : undefined,
+        pool: typeof data.pool === "string" ? data.pool.slice(0, 32) : undefined,
       };
       tokenListeners.forEach((listener) => listener(frame));
     } catch {
