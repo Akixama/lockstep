@@ -6,11 +6,12 @@ export const runtime = "nodejs";
 export const maxDuration = 300;
 
 const MINT_PATTERN = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+const MAX_MINTS_PER_STREAM = 96;
 const STREAM_LIFETIME_MS = 285_000;
 const HEARTBEAT_MS = 15_000;
 const MAX_ACTIVE_STREAMS = 128;
 const MAX_STREAMS_PER_IP = 8;
-const MAX_STARTS_PER_MINUTE = 24;
+const MAX_STARTS_PER_MINUTE = 120;
 const MAX_TRACKED_IPS = 2_048;
 
 type IpUsage = { active: number; starts: number[] };
@@ -65,14 +66,20 @@ function persistentRelayConfigured() {
   return Boolean(process.env.PUMPPORTAL_RELAY_URL?.trim() && process.env.PUMPPORTAL_RELAY_SECRET?.trim());
 }
 
-async function openPersistentRelay(request: NextRequest, mint: string, releaseStream: () => void) {
+function requestMints(request: NextRequest) {
+  const mints = [...new Set(request.nextUrl.searchParams.getAll("mint"))];
+  if (mints.length === 0 || mints.length > MAX_MINTS_PER_STREAM || mints.some((mint) => !MINT_PATTERN.test(mint))) return null;
+  return mints;
+}
+
+async function openPersistentRelay(request: NextRequest, mints: string[], releaseStream: () => void) {
   const relayUrl = process.env.PUMPPORTAL_RELAY_URL?.trim();
   const relaySecret = process.env.PUMPPORTAL_RELAY_SECRET?.trim();
   if (!relayUrl || !relaySecret) return null;
 
   try {
     const upstreamUrl = new URL("/trades", relayUrl);
-    upstreamUrl.searchParams.set("mint", mint);
+    mints.forEach((mint) => upstreamUrl.searchParams.append("mint", mint));
     const upstream = await fetch(upstreamUrl, {
       headers: { authorization: `Bearer ${relaySecret}` },
       cache: "no-store",
@@ -125,15 +132,15 @@ async function openPersistentRelay(request: NextRequest, mint: string, releaseSt
 }
 
 export async function GET(request: NextRequest) {
-  const mint = request.nextUrl.searchParams.get("mint") ?? "";
-  if (!MINT_PATTERN.test(mint)) return NextResponse.json({ error: "Invalid token" }, { status: 400 });
+  const mints = requestMints(request);
+  if (!mints) return NextResponse.json({ error: "Invalid token list" }, { status: 400 });
   if (!sameSiteRequest(request)) return NextResponse.json({ error: "Cross-site access is not allowed" }, { status: 403 });
   if (!persistentRelayConfigured() && !process.env.PUMPPORTAL_API_KEY?.trim()) return NextResponse.json({ error: "Live trade feed is unavailable" }, { status: 503 });
 
   const releaseStream = reserveStream(requestIp(request));
   if (!releaseStream) return NextResponse.json({ error: "Live trade feed is busy; backup polling remains active" }, { status: 429 });
 
-  const persistentRelay = await openPersistentRelay(request, mint, releaseStream);
+  const persistentRelay = await openPersistentRelay(request, mints, releaseStream);
   if (persistentRelay) return persistentRelay;
   if (!process.env.PUMPPORTAL_API_KEY?.trim()) {
     releaseStream();
@@ -158,9 +165,12 @@ export async function GET(request: NextRequest) {
         try { controller.close(); } catch { /* already disconnected */ }
       };
       let unsubscribe: () => void;
+      const unsubscribers: Array<() => void> = [];
       try {
-        unsubscribe = pumpPortalRelay.subscribe(mint, (frame) => write(`data: ${JSON.stringify(frame)}\n\n`));
+        mints.forEach((mint) => unsubscribers.push(pumpPortalRelay.subscribe(mint, (frame) => write(`data: ${JSON.stringify(frame)}\n\n`))));
+        unsubscribe = () => unsubscribers.forEach((stop) => stop());
       } catch {
+        unsubscribers.forEach((stop) => stop());
         releaseStream();
         controller.error(new Error("Live trade feed is busy"));
         return;

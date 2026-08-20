@@ -72,7 +72,12 @@ export type LiveBuyQuote = {
 
 export type PaperBuyBuild = { transactionBytes: number };
 
-export type TokenTradeWatcher = (mint: string, onTrade: (mark: LaunchCandidate) => void) => () => void;
+export type TokenTradeStreamStatus = "connecting" | "live" | "error";
+export type TokenTradeWatcher = (
+  mint: string,
+  onTrade: (mark: LaunchCandidate) => void,
+  onStatus?: (status: TokenTradeStreamStatus) => void,
+) => () => void;
 
 const LAMPORTS_PER_SOL = 1_000_000_000;
 const TOTAL_BONDING_CURVE_FEE_BPS = 125n;
@@ -705,35 +710,120 @@ export function openMigrationFeed(
     if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify(payload));
   };
 
-  // Metered token trades are relayed by our server so the funded PumpPortal
-  // key never reaches a visitor's browser. Each watch is short-lived and the
-  // server deduplicates subscriptions across visitors on a warm instance.
-  const watchTokenTrades: TokenTradeWatcher = (mint, onTrade) => {
-    const stream = new EventSource(`/api/pumpportal-trades?mint=${encodeURIComponent(mint)}`);
-    stream.addEventListener("message", (event) => {
-      try {
-        const data = JSON.parse(String(event.data)) as Record<string, unknown>;
-        const marketCapSol = Number(data.marketCapSol);
-        const marketCapUsd = Number(data.marketCapUsd);
-        // subscribeTokenTrade covers every venue for a mint. Migration mode
-        // must never react to bonding-curve trades, including frames queued
-        // around the exact moment the curve completes.
-        if (data.mint !== mint || !isPostMigrationTradePool(data.pool)
-          || !Number.isFinite(marketCapSol) || marketCapSol <= 0) return;
-        onTrade({
-          mint,
-          symbol: typeof data.symbol === "string" ? data.symbol : "MIG",
-          name: typeof data.name === "string" ? data.name : "Migrated token",
-          priceSol: marketCapSol / 1_000_000_000,
-          marketCapSol,
-          marketCapUsd: Number.isFinite(marketCapUsd) && marketCapUsd > 0 ? marketCapUsd : undefined,
-          observedAt: Date.now(),
-          observationSource: "trade-stream",
-          observationPool: String(data.pool),
-        });
-      } catch { /* ignore malformed relay frames */ }
+  type TradeListener = {
+    onTrade: (mark: LaunchCandidate) => void;
+    onStatus?: (status: TokenTradeStreamStatus) => void;
+  };
+  const tradeListeners = new Map<string, Set<TradeListener>>();
+  let activeTradeStream: EventSource | null = null;
+  let pendingTradeStream: EventSource | null = null;
+  let tradeStreamRevision = 0;
+  let tradeStreamRebuildTimer: number | null = null;
+
+  const notifyTradeStatus = (status: TokenTradeStreamStatus) => {
+    tradeListeners.forEach((listeners) => listeners.forEach((listener) => listener.onStatus?.(status)));
+  };
+
+  const handleTradeFrame = (event: MessageEvent) => {
+    try {
+      const data = JSON.parse(String(event.data)) as Record<string, unknown>;
+      const mint = typeof data.mint === "string" ? data.mint : "";
+      const listeners = tradeListeners.get(mint);
+      const marketCapSol = Number(data.marketCapSol);
+      const marketCapUsd = Number(data.marketCapUsd);
+      // subscribeTokenTrade covers every venue for a mint. Migration mode
+      // must never react to bonding-curve trades, including frames queued
+      // around the exact moment the curve completes.
+      if (!listeners?.size || !isPostMigrationTradePool(data.pool)
+        || !Number.isFinite(marketCapSol) || marketCapSol <= 0) return;
+      const mark: LaunchCandidate = {
+        mint,
+        symbol: typeof data.symbol === "string" ? data.symbol : "MIG",
+        name: typeof data.name === "string" ? data.name : "Migrated token",
+        priceSol: marketCapSol / 1_000_000_000,
+        marketCapSol,
+        marketCapUsd: Number.isFinite(marketCapUsd) && marketCapUsd > 0 ? marketCapUsd : undefined,
+        observedAt: Date.now(),
+        observationSource: "trade-stream",
+        observationPool: String(data.pool),
+      };
+      listeners.forEach((listener) => listener.onTrade(mark));
+    } catch { /* ignore malformed relay frames */ }
+  };
+
+  // All active migration watches share one browser SSE connection. When the
+  // mint set changes, open the replacement first and only then close the old
+  // stream so a newly migrated token does not create a detection blind spot.
+  const rebuildTradeStream = () => {
+    tradeStreamRebuildTimer = null;
+    const mints = [...tradeListeners.keys()];
+    if (mints.length === 0) {
+      tradeStreamRevision += 1;
+      pendingTradeStream?.close();
+      activeTradeStream?.close();
+      pendingTradeStream = null;
+      activeTradeStream = null;
+      return;
+    }
+
+    const revision = ++tradeStreamRevision;
+    pendingTradeStream?.close();
+    const params = new URLSearchParams();
+    mints.forEach((mint) => params.append("mint", mint));
+    const nextStream = new EventSource(`/api/pumpportal-trades?${params.toString()}`);
+    pendingTradeStream = nextStream;
+    notifyTradeStatus("connecting");
+    nextStream.addEventListener("message", handleTradeFrame);
+    nextStream.addEventListener("open", () => {
+      if (revision !== tradeStreamRevision || pendingTradeStream !== nextStream) {
+        nextStream.close();
+        return;
+      }
+      const previousStream = activeTradeStream;
+      activeTradeStream = nextStream;
+      pendingTradeStream = null;
+      previousStream?.close();
+      notifyTradeStatus("live");
     });
-    return () => stream.close();
+    nextStream.addEventListener("error", () => {
+      if (revision !== tradeStreamRevision || (pendingTradeStream !== nextStream && activeTradeStream !== nextStream)) return;
+      notifyTradeStatus("error");
+      if (pendingTradeStream === nextStream) {
+        pendingTradeStream = null;
+        nextStream.close();
+        if (tradeStreamRebuildTimer === null) tradeStreamRebuildTimer = window.setTimeout(rebuildTradeStream, 1_000);
+      }
+    });
+  };
+
+  const scheduleTradeStreamRebuild = () => {
+    if (tradeStreamRebuildTimer !== null) window.clearTimeout(tradeStreamRebuildTimer);
+    tradeStreamRebuildTimer = window.setTimeout(rebuildTradeStream, 50);
+  };
+
+  // Metered token trades are relayed by our server so the funded PumpPortal
+  // key never reaches a visitor's browser. The shared stream prevents one
+  // five-minute connection per watched coin from exhausting the per-IP cap.
+  const watchTokenTrades: TokenTradeWatcher = (mint, onTrade, onStatus) => {
+    const listener: TradeListener = { onTrade, onStatus };
+    let listeners = tradeListeners.get(mint);
+    if (!listeners) {
+      listeners = new Set();
+      tradeListeners.set(mint, listeners);
+    }
+    listeners.add(listener);
+    onStatus?.("connecting");
+    scheduleTradeStreamRebuild();
+
+    let removed = false;
+    return () => {
+      if (removed) return;
+      removed = true;
+      const current = tradeListeners.get(mint);
+      current?.delete(listener);
+      if (current?.size === 0) tradeListeners.delete(mint);
+      scheduleTradeStreamRebuild();
+    };
   };
 
   const handleMessage = (event: MessageEvent) => {
@@ -796,6 +886,10 @@ export function openMigrationFeed(
   return () => {
     stopped = true;
     if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
+    if (tradeStreamRebuildTimer !== null) window.clearTimeout(tradeStreamRebuildTimer);
+    pendingTradeStream?.close();
+    activeTradeStream?.close();
+    tradeListeners.clear();
     socket?.close();
     socket = null;
   };

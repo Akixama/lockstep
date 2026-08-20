@@ -781,10 +781,24 @@ export default function LockstepApp() {
     // through the configured entry band.
     const streamedMarks: LaunchCandidate[] = [];
     let wakeStreamWait: (() => void) | null = null;
-    const stopTradeWatch = watchTokenTrades?.(unverifiedCandidate.mint, (mark) => {
-      streamedMarks.push(mark);
-      wakeStreamWait?.();
-    });
+    let relayFailureReported = false;
+    const stopTradeWatch = watchTokenTrades?.(
+      unverifiedCandidate.mint,
+      (mark) => {
+        streamedMarks.push(mark);
+        wakeStreamWait?.();
+      },
+      (status) => {
+        if (status !== "error" || relayFailureReported) return;
+        relayFailureReported = true;
+        addExecutionActivity(
+          `${unverifiedCandidate.symbol} live feed unavailable`,
+          "The shared PumpPortal stream could not connect · backup polling remains active for this watch",
+          "warn",
+          unverifiedCandidate.mint,
+        );
+      },
+    );
     const waitForTradeOrFallback = () => new Promise<void>((resolve) => {
       let settled = false;
       const finish = () => {
@@ -820,7 +834,7 @@ export default function LockstepApp() {
     const migrationStartedAt = Date.now() - Math.max(0, migrationAge) * 1000;
     const watchDeadline = migrationStartedAt + MIGRATION_WINDOW_SECONDS * 1000;
     const rugTriggerLabel = `${formatUsdMarketCap(migrationExecutionSettings.boostEntryMinMarketCapUsd)}–${formatUsdMarketCap(migrationExecutionSettings.boostEntryMarketCapUsd)}`;
-    addExecutionActivity(`${candidate.symbol} BOOST watch`, `${watchTokenTrades ? "Live trades + backup polling" : "Backup polling"} for up to ${Math.max(0, Math.ceil((watchDeadline - Date.now()) / 1000))}s · waiting for the coin to enter ${rugTriggerLabel}`, "neutral", candidate.mint);
+    addExecutionActivity(`${candidate.symbol} BOOST watch`, `${watchTokenTrades ? "Shared live stream + backup polling" : "Backup polling"} for up to ${Math.max(0, Math.ceil((watchDeadline - Date.now()) / 1000))}s · waiting for the coin to enter ${rugTriggerLabel}`, "neutral", candidate.mint);
     // LOGGING: every price check this watch performs (stream-confirm or
     // direct poll, success or failure) is now written to console so a
     // watch's full price history is searchable in Vercel's function logs by

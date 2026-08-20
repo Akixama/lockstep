@@ -5,7 +5,8 @@ const PORT = Number(process.env.PORT) || 8080;
 const PUMPPORTAL_API_KEY = process.env.PUMPPORTAL_API_KEY?.trim() ?? "";
 const RELAY_SECRET = process.env.LOCKSTEP_RELAY_SECRET?.trim() ?? "";
 const MINT_PATTERN = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
-const MAX_ACTIVE_TOKENS = 64;
+const MAX_MINTS_PER_STREAM = 96;
+const MAX_ACTIVE_TOKENS = 128;
 const MAX_LISTENERS_PER_TOKEN = 32;
 const STREAM_LIFETIME_MS = 285_000;
 const HEARTBEAT_MS = 15_000;
@@ -147,9 +148,9 @@ const server = createServer((request, response) => {
     sendJson(response, 401, { error: "Unauthorized" });
     return;
   }
-  const mint = url.searchParams.get("mint") ?? "";
-  if (!MINT_PATTERN.test(mint)) {
-    sendJson(response, 400, { error: "Invalid token" });
+  const mints = [...new Set(url.searchParams.getAll("mint"))];
+  if (mints.length === 0 || mints.length > MAX_MINTS_PER_STREAM || mints.some((mint) => !MINT_PATTERN.test(mint))) {
+    sendJson(response, 400, { error: "Invalid token list" });
     return;
   }
 
@@ -174,11 +175,14 @@ const server = createServer((request, response) => {
     unsubscribe?.();
     if (!response.writableEnded) response.end();
   };
+  const unsubscribers = [];
   try {
-    unsubscribe = relay.subscribe(mint, (frame) => {
+    mints.forEach((mint) => unsubscribers.push(relay.subscribe(mint, (frame) => {
       if (!closed) response.write(`data: ${JSON.stringify(frame)}\n\n`);
-    });
+    })));
+    unsubscribe = () => unsubscribers.forEach((stop) => stop());
   } catch {
+    unsubscribers.forEach((stop) => stop());
     response.write(`event: relay-error\ndata: ${JSON.stringify({ error: "Live trade feed is busy" })}\n\n`);
     finish();
     return;

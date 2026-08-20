@@ -29,7 +29,7 @@ test("Migration Paper starts from its confirmed defaults instead of legacy setti
   assert.match(source, /streamedMarketCapUsd >= migrationExecutionSettings\.boostEntryMinMarketCapUsd/);
   assert.match(source, /marketCapUsd >= migrationExecutionSettings\.boostEntryMinMarketCapUsd/);
   assert.match(source, /outside \$\{rugTriggerLabel\}/);
-  assert.match(source, /Live trades \+ backup polling/);
+  assert.match(source, /Shared live stream \+ backup polling/);
   assert.doesNotMatch(source, /PUMPPORTAL API KEY/);
   assert.doesNotMatch(source, /PUMPPORTAL_API_KEY/);
   assert.match(source, /nextSliceAt: completedAt \+ current\.paperExitPlan\.intervalSeconds \* 1000/);
@@ -60,7 +60,10 @@ test("Migration feed consumes the protected server relay for metered token trade
   const routeSource = await readFile(relayRouteSourceUrl, "utf8");
   const relaySource = await readFile(relaySourceUrl, "utf8");
 
-  assert.match(source, /new EventSource\(`\/api\/pumpportal-trades\?mint=/);
+  assert.match(source, /new EventSource\(`\/api\/pumpportal-trades\?\$\{params\.toString\(\)\}`\)/);
+  assert.equal((source.match(/new EventSource/g) ?? []).length, 1);
+  assert.match(source, /const tradeListeners = new Map/);
+  assert.match(source, /mints\.forEach\(\(mint\) => params\.append\("mint", mint\)\)/);
   assert.doesNotMatch(source, /PUMPPORTAL_API_KEY/);
   assert.equal((source.match(/new WebSocket/g) ?? []).length, 2);
   assert.match(source, /const watchTokenTrades: TokenTradeWatcher =/);
@@ -68,6 +71,8 @@ test("Migration feed consumes the protected server relay for metered token trade
   assert.match(source, /observationSource: "trade-stream"/);
   assert.match(routeSource, /process\.env\.PUMPPORTAL_API_KEY/);
   assert.match(routeSource, /MAX_STREAMS_PER_IP/);
+  assert.match(routeSource, /MAX_MINTS_PER_STREAM/);
+  assert.match(routeSource, /searchParams\.getAll\("mint"\)/);
   assert.match(routeSource, /MAX_STARTS_PER_MINUTE/);
   assert.match(routeSource, /MAX_TRACKED_IPS/);
   assert.match(routeSource, /text\/event-stream/);
@@ -93,6 +98,7 @@ test("Persistent relay keeps one protected PumpPortal connection warm", async ()
   assert.match(source, /timingSafeEqual/);
   assert.match(source, /url\.pathname === "\/health"/);
   assert.match(source, /url\.pathname !== "\/trades"/);
+  assert.match(source, /url\.searchParams\.getAll\("mint"\)/);
 });
 
 test("Fresh per-token trades trigger immediately and USD market cap falls back to SOL", async () => {
@@ -108,7 +114,8 @@ test("Fresh per-token trades trigger immediately and USD market cap falls back t
   assert.match(source, /PumpPortal live trade/);
   assert.match(source, /verified backup poll/);
   assert.match(source, /freshTrigger/);
-  assert.match(source, /watchTokenTrades\?\.\(unverifiedCandidate\.mint/);
+  assert.match(source, /watchTokenTrades\?\.\(\s*unverifiedCandidate\.mint/);
+  assert.match(source, /live feed unavailable/);
   assert.match(source, /buffer frames while the/);
   assert.match(source, /Date\.now\(\) - Number\(triggerCandidate\.observedAt\) <= LIVE_QUOTE_MAX_AGE_MS/);
   assert.doesNotMatch(source, /stream-confirm:/);
