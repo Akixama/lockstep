@@ -165,7 +165,16 @@ function formatMarketCap(valueSol: number, solUsdPrice: number, directUsd?: numb
   if (!Number.isFinite(value) || value <= 0) return "— MC";
   if (value >= 1_000_000) return `$${(value / 1_000_000).toFixed(value >= 10_000_000 ? 1 : 2)}M MC`;
   if (value >= 1_000) return `$${(value / 1_000).toFixed(value >= 10_000 ? 1 : 2)}K MC`;
-  return `$${value.toFixed(value >= 100 ? 0 : 2)} MC`;
+  return `${value.toFixed(value >= 100 ? 0 : 2)} MC`;
+}
+
+function marketCapUsdFor(mark: Pick<LaunchCandidate, "marketCapSol" | "marketCapUsd">, solUsdPrice: number) {
+  const directUsd = Number(mark.marketCapUsd);
+  if (Number.isFinite(directUsd) && directUsd > 0) return directUsd;
+  const marketCapSol = Number(mark.marketCapSol);
+  return Number.isFinite(marketCapSol) && marketCapSol > 0 && Number.isFinite(solUsdPrice) && solUsdPrice > 0
+    ? marketCapSol * solUsdPrice
+    : NaN;
 }
 
 function paperMarkRatio(position: LivePosition, nextPriceSol = position.currentPriceSol) {
@@ -818,43 +827,26 @@ export default function LockstepApp() {
       window.setTimeout(finish, MIGRATION_WATCH_POLL_MS);
     });
     while (Date.now() < watchDeadline && engineModeRef.current === "active" && strategyModeRef.current === migrationMode) {
-      const streamedMark = streamedMarks.pop();
+      const streamedMark = streamedMarks.shift();
       if (streamedMark) {
-        const streamedMarketCapUsd = Number(streamedMark.marketCapUsd) > 0 ? Number(streamedMark.marketCapUsd) : streamedMark.marketCapSol * solUsdPrice;
+        const streamedMarketCapUsd = marketCapUsdFor(streamedMark, solUsdPrice);
         const crossedRugTrigger = Number.isFinite(streamedMarketCapUsd)
           && streamedMarketCapUsd >= migrationExecutionSettings.boostEntryMinMarketCapUsd
           && streamedMarketCapUsd <= migrationExecutionSettings.boostEntryMarketCapUsd;
-        // FIX: a raw streamed trade frame's market cap is not trusted on its own
-        // anymore. PumpPortal's subscribeTokenTrade frames can carry a stale or
-        // otherwise bogus marketCapSol/marketCapUsd (e.g. a leftover bonding-curve
-        // figure right around migration), which previously could fire a trigger
-        // wildly detached from the token's real price - the execution-time
-        // fetchPumpPrice() call a few lines below would then see the real price,
-        // and the order would blow through slippage and fail. Now a streamed mark
-        // only decides *when* to check; fetchPumpPrice() is the source of truth
-        // for whether the coin is actually in range before a trigger fires.
+        // The migration was already verified before this watch began. A fresh
+        // per-token trade is therefore the lowest-latency price source and must
+        // be allowed to trigger directly; waiting for an HTTP confirmation can
+        // let a fast token cross the whole entry band before the response lands.
         if (crossedRugTrigger) {
-          try {
-            const confirmed = await fetchPumpPrice(candidate.mint);
-            const confirmedMarketCapUsd = Number(confirmed.marketCapUsd);
-            const confirmedInRange = Number.isFinite(confirmedMarketCapUsd)
-              && confirmedMarketCapUsd >= migrationExecutionSettings.boostEntryMinMarketCapUsd
-              && confirmedMarketCapUsd <= migrationExecutionSettings.boostEntryMarketCapUsd;
-            console.log(`[BOOST watch] ${candidate.mint} (${candidate.symbol}) stream-confirm: streamMc=${streamedMarketCapUsd} confirmMc=${confirmedMarketCapUsd} inRange=${confirmedInRange} t=${new Date().toISOString()}`);
-            if (confirmedInRange) {
-              triggerCandidate = { ...candidate, ...confirmed, marketCapUsd: confirmedMarketCapUsd };
-              break;
-            }
-          } catch (err) {
-            console.log(`[BOOST watch] ${candidate.mint} (${candidate.symbol}) stream-confirm FAILED: ${err instanceof Error ? err.message : String(err)} t=${new Date().toISOString()}`);
-            /* confirmation fetch failed; keep watching rather than trust the raw stream mark */
-          }
+          triggerCandidate = { ...candidate, ...streamedMark, marketCapUsd: streamedMarketCapUsd };
+          console.log(`[BOOST watch] ${candidate.mint} (${candidate.symbol}) live-trade trigger: mc=${streamedMarketCapUsd} t=${new Date().toISOString()}`);
+          break;
         }
         continue;
       }
       try {
         const mark = await fetchPumpPrice(candidate.mint);
-        const marketCapUsd = Number(mark.marketCapUsd);
+        const marketCapUsd = marketCapUsdFor(mark, solUsdPrice);
         const crossedRugTrigger = Number.isFinite(marketCapUsd)
           && marketCapUsd >= migrationExecutionSettings.boostEntryMinMarketCapUsd
           && marketCapUsd <= migrationExecutionSettings.boostEntryMarketCapUsd;
@@ -887,24 +879,30 @@ export default function LockstepApp() {
       return;
     }
     const triggerMarketCapUsd = Number(triggerCandidate.marketCapUsd);
-    try {
-      const executionMark = await fetchPumpPrice(triggerCandidate.mint);
-      candidate = {
-        ...triggerCandidate,
-        symbol: executionMark.symbol || triggerCandidate.symbol,
-        name: executionMark.name || triggerCandidate.name,
-        priceSol: executionMark.priceSol,
-        marketCapSol: executionMark.marketCapSol,
-        marketCapUsd: executionMark.marketCapUsd,
-        isMayhemMode: executionMark.isMayhemMode,
-        boostMode: executionMark.boostMode,
-        isStandardPumpfunMigration: executionMark.isStandardPumpfunMigration,
-      };
-    } catch {
-      addExecutionActivity(`${paperExecution ? "Paper" : "Live"} entry failed: ${triggerCandidate.symbol}`, `Immediate execution quote was unavailable · no ${paperExecution ? "fake" : "live"} fill`, "warn", triggerCandidate.mint);
-      return;
+    const freshStreamTrigger = triggerCandidate.observationSource === "trade-stream"
+      && Date.now() - Number(triggerCandidate.observedAt) <= 2_000;
+    if (freshStreamTrigger) {
+      candidate = triggerCandidate;
+    } else {
+      try {
+        const executionMark = await fetchPumpPrice(triggerCandidate.mint);
+        candidate = {
+          ...triggerCandidate,
+          symbol: executionMark.symbol || triggerCandidate.symbol,
+          name: executionMark.name || triggerCandidate.name,
+          priceSol: executionMark.priceSol,
+          marketCapSol: executionMark.marketCapSol,
+          marketCapUsd: marketCapUsdFor(executionMark, solUsdPrice),
+          isMayhemMode: executionMark.isMayhemMode,
+          boostMode: executionMark.boostMode,
+          isStandardPumpfunMigration: executionMark.isStandardPumpfunMigration,
+        };
+      } catch {
+        addExecutionActivity(`${paperExecution ? "Paper" : "Live"} entry failed: ${triggerCandidate.symbol}`, `Immediate execution quote was unavailable · no ${paperExecution ? "fake" : "live"} fill`, "warn", triggerCandidate.mint);
+        return;
+      }
     }
-    const executionMarketCapUsd = Number(candidate.marketCapUsd);
+    const executionMarketCapUsd = marketCapUsdFor(candidate, solUsdPrice);
     if (Date.now() >= watchDeadline) {
       addExecutionActivity(`${paperExecution ? "Paper" : "Live"} entry missed: ${candidate.symbol}`, "The five-minute post-migration window expired before the immediate quote returned", "warn", candidate.mint);
       return;
@@ -1004,7 +1002,7 @@ export default function LockstepApp() {
             if (Date.now() >= watchDeadline || engineModeRef.current !== "active" || strategyModeRef.current !== migrationMode || positionsRef.current.some((position) => position.mint === candidate.mint)) return false;
             try {
               const retryMark = await fetchPumpPrice(candidate.mint);
-              const retryMarketCapUsd = Number(retryMark.marketCapUsd);
+              const retryMarketCapUsd = marketCapUsdFor(retryMark, solUsdPrice);
               return !retryMark.isMayhemMode
                 && retryMark.isStandardPumpfunMigration === true
                 && Number.isFinite(retryMarketCapUsd)
