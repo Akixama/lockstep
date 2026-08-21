@@ -14,7 +14,6 @@ test("Migration Paper starts from its confirmed defaults instead of legacy setti
 
   assert.match(source, /buyAmount:\s*5,/);
   assert.match(source, /buyAmount:\s*5,\s*\n\s*slippage:\s*50,/);
-  assert.match(source, /maxEntryImpact:\s*15,/);
   assert.match(source, /takeProfit:\s*300,/);
   assert.match(source, /paperStartingBalance:\s*10,/);
   assert.match(source, /boostEntryMinMarketCapUsd:\s*1600,/);
@@ -121,8 +120,10 @@ test("Fresh per-token trades trigger immediately and USD market cap falls back t
   assert.match(source, /triggerReceipt/);
   assert.match(source, /getConfirmedBuyFill/);
   assert.match(source, /confirmed fill/);
-  assert.match(source, /maximumImpactPercent:\s*migrationExecutionSettings\.maxEntryImpact/);
-  assert.match(tradingSource, /Projected confirmed fill/);
+  assert.match(source, /maximumMarketCapUsd:\s*migrationExecutionSettings\.boostEntryMarketCapUsd/);
+  assert.match(tradingSource, /Projected average fill/);
+  assert.match(tradingSource, /exceeds the \$\$\{entryGuard\.maximumMarketCapUsd\.toFixed\(0\)\} MC strategy maximum/);
+  assert.doesNotMatch(source, /Maximum entry impact/);
   assert.match(tradingSource, /Entry protection could not verify a fresh PumpSwap fill/);
   assert.match(source, /Live entry protected/);
   assert.match(source, /instanceof LiveTradeEntryGuardError/);

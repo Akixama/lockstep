@@ -214,7 +214,7 @@ async function buildLocalPumpSwapBuyTransaction({ keypair, mint, amountSol, slip
   amountSol: number;
   slippagePercent: number;
   priorityFeeSol: number;
-  entryGuard?: { referenceMarketCapUsd: number; maximumMarketCapUsd: number; maximumImpactPercent: number; solUsdPrice: number };
+  entryGuard?: { referenceMarketCapUsd: number; maximumMarketCapUsd: number; solUsdPrice: number };
 }) {
   const key = pumpSwapPreparationKey(mint, keypair.publicKey);
   let prepared = await preparePumpSwapState(mint, keypair.publicKey);
@@ -272,11 +272,10 @@ async function buildLocalPumpSwapBuyTransaction({ keypair, mint, amountSol, slip
     const projectedFillMarketCapUsd = amountSol / estimatedTokensOut * 1_000_000_000 * entryGuard.solUsdPrice;
     const projectedImpactPercent = (projectedFillMarketCapUsd / entryGuard.referenceMarketCapUsd - 1) * 100;
     if (!Number.isFinite(projectedFillMarketCapUsd)
-      || projectedFillMarketCapUsd > entryGuard.maximumMarketCapUsd
       || !Number.isFinite(projectedImpactPercent)
-      || projectedImpactPercent > entryGuard.maximumImpactPercent) {
+      || projectedFillMarketCapUsd > entryGuard.maximumMarketCapUsd) {
       throw new LiveTradeEntryGuardError(
-        `Projected confirmed fill $${projectedFillMarketCapUsd.toFixed(0)} MC · ${Math.max(0, projectedImpactPercent).toFixed(1)}% impact exceeds the entry protection`,
+        `Projected average fill $${projectedFillMarketCapUsd.toFixed(0)} MC · ${Math.max(0, projectedImpactPercent).toFixed(1)}% above trigger exceeds the $${entryGuard.maximumMarketCapUsd.toFixed(0)} MC strategy maximum`,
       );
     }
   }
@@ -544,7 +543,7 @@ export function formatLiveExecutionDiagnostics(value: unknown) {
   ].filter(Boolean).join(" · ");
 }
 
-async function attemptTrade({ keypair, action, mint, amount, slippagePercent, pool, priorityFeeSol, knownBalanceSol, attempt, signalObservedAt, entryGuard }: { keypair: Keypair; action: "buy" | "sell"; mint: string; amount: number | string; slippagePercent: number; pool: "auto" | "pump" | "pump-amm"; priorityFeeSol: number; knownBalanceSol?: number; attempt: number; signalObservedAt?: number; entryGuard?: { referenceMarketCapUsd: number; maximumMarketCapUsd: number; maximumImpactPercent: number; solUsdPrice: number } }) {
+async function attemptTrade({ keypair, action, mint, amount, slippagePercent, pool, priorityFeeSol, knownBalanceSol, attempt, signalObservedAt, entryGuard }: { keypair: Keypair; action: "buy" | "sell"; mint: string; amount: number | string; slippagePercent: number; pool: "auto" | "pump" | "pump-amm"; priorityFeeSol: number; knownBalanceSol?: number; attempt: number; signalObservedAt?: number; entryGuard?: { referenceMarketCapUsd: number; maximumMarketCapUsd: number; solUsdPrice: number } }) {
   const attemptStartedAt = performance.now();
   const diagnostics: LiveExecutionDiagnostics = {
     attempt,
@@ -682,7 +681,7 @@ export async function buildSignAndSendTrade({ keypair, action, mint, amount, sli
   pool?: "auto" | "pump" | "pump-amm";
   knownBalanceSol?: number;
   signalObservedAt?: number;
-  entryGuard?: { referenceMarketCapUsd: number; maximumMarketCapUsd: number; maximumImpactPercent: number; solUsdPrice: number };
+  entryGuard?: { referenceMarketCapUsd: number; maximumMarketCapUsd: number; solUsdPrice: number };
   freshTransactionRetries?: number;
   shouldRetryFreshTransaction?: () => Promise<boolean>;
   onFreshTransactionRetry?: (attempt: number, diagnostics?: LiveExecutionDiagnostics) => void;
