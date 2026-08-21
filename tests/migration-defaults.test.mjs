@@ -126,6 +126,13 @@ test("Fresh per-token trades trigger immediately and USD market cap falls back t
   assert.match(source, /getConfirmedBuyFill/);
   assert.match(source, /confirmed fill/);
   assert.match(source, /maximumMarketCapUsd:\s*migrationExecutionSettings\.boostEntryMarketCapUsd/);
+  assert.match(source, /minimumMarketCapUsd:\s*migrationExecutionSettings\.boostEntryMinMarketCapUsd/);
+  assert.match(source, /reportedMarketCapUsd:\s*triggerMarketCapUsd/);
+  assert.match(source, /PumpPortal reported/);
+  assert.match(tradingSource, /effectiveQuoteReserveLamports = poolQuoteAmount\.add\(pool\.virtualQuoteReserves\)/);
+  assert.match(tradingSource, /verifiedMarketCapUsd < entryGuard\.minimumMarketCapUsd/);
+  assert.match(tradingSource, /Verified on-chain MC/);
+  assert.match(tradingSource, /projectedFillMarketCapUsd \/ verifiedMarketCapUsd/);
   assert.match(tradingSource, /Projected average fill/);
   assert.match(tradingSource, /exceeds the \$\$\{entryGuard\.maximumMarketCapUsd\.toFixed\(0\)\} MC strategy maximum/);
   assert.match(tradingSource, /minimumMarketCapBaseAmountOut\.gt\(slippageMinBaseAmountOut\)/);
@@ -155,6 +162,7 @@ test("Fresh per-token trades trigger immediately and USD market cap falls back t
   assert.match(tradingSource, /minBaseAmountOut/);
   assert.match(tradingSource, /knownBalanceSol/);
   assert.match(source, /Date\.now\(\) - Number\(triggerCandidate\.observedAt\) <= LIVE_QUOTE_MAX_AGE_MS/);
+  assert.doesNotMatch(source, /const retryMark = await fetchPumpPrice\(candidate\.mint\)/);
   assert.doesNotMatch(source, /stream-confirm:/);
   assert.doesNotMatch(source, /After execution latency/);
 });

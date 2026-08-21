@@ -75,6 +75,13 @@ export type LiveBuyQuote = {
 
 export type PaperBuyBuild = { transactionBytes: number };
 
+type PumpSwapEntryGuard = {
+  reportedMarketCapUsd?: number;
+  minimumMarketCapUsd: number;
+  maximumMarketCapUsd: number;
+  solUsdPrice: number;
+};
+
 export type LiveExecutionDiagnostics = {
   attempt: number;
   builder: "local-pumpswap" | "remote" | "remote-fallback" | "unknown";
@@ -215,7 +222,7 @@ async function buildLocalPumpSwapBuyTransaction({ keypair, mint, amountSol, slip
   amountSol: number;
   slippagePercent: number;
   priorityFeeSol: number;
-  entryGuard?: { referenceMarketCapUsd: number; maximumMarketCapUsd: number; solUsdPrice: number };
+  entryGuard?: PumpSwapEntryGuard;
 }) {
   const key = pumpSwapPreparationKey(mint, keypair.publicKey);
   let prepared = await preparePumpSwapState(mint, keypair.publicKey);
@@ -255,6 +262,30 @@ async function buildLocalPumpSwapBuyTransaction({ keypair, mint, amountSol, slip
   const quoteLamports = Math.round(amountSol * LAMPORTS_PER_SOL);
   if (!Number.isSafeInteger(quoteLamports) || quoteLamports <= 0) throw new Error("The local PumpSwap order amount was invalid");
   const spendableQuoteIn = new BN(quoteLamports);
+  const baseUnitScale = 10 ** Number(state.baseMintAccount.decimals);
+  const totalSupplyTokens = Number(state.baseMintAccount.supply.toString()) / baseUnitScale;
+  let verifiedMarketCapUsd = Number.NaN;
+  if (entryGuard) {
+    // PumpPortal is deliberately only the low-latency wake-up signal. These
+    // accounts are the same fresh processed-state read used to quote and build
+    // the transaction, so verifying the real PumpSwap spot adds no RPC round
+    // trip to the critical path.
+    const effectiveQuoteReserveLamports = poolQuoteAmount.add(pool.virtualQuoteReserves);
+    const poolBaseTokens = Number(poolBaseAmount.toString()) / baseUnitScale;
+    const effectiveQuoteReserveSol = Number(effectiveQuoteReserveLamports.toString()) / LAMPORTS_PER_SOL;
+    const verifiedSpotPriceSol = effectiveQuoteReserveSol / poolBaseTokens;
+    verifiedMarketCapUsd = verifiedSpotPriceSol * totalSupplyTokens * entryGuard.solUsdPrice;
+    if (!Number.isFinite(verifiedMarketCapUsd)
+      || verifiedMarketCapUsd < entryGuard.minimumMarketCapUsd
+      || verifiedMarketCapUsd > entryGuard.maximumMarketCapUsd) {
+      const reported = Number.isFinite(entryGuard.reportedMarketCapUsd)
+        ? ` (PumpPortal reported $${Number(entryGuard.reportedMarketCapUsd).toFixed(0)})`
+        : "";
+      throw new LiveTradeEntryGuardError(
+        `Verified on-chain MC $${Number.isFinite(verifiedMarketCapUsd) ? verifiedMarketCapUsd.toFixed(0) : "unavailable"}${reported} was outside the $${entryGuard.minimumMarketCapUsd.toFixed(0)}–$${entryGuard.maximumMarketCapUsd.toFixed(0)} strategy range`,
+      );
+    }
+  }
   const quote = pumpSwapModule.buyQuoteInput({
     quote: spendableQuoteIn,
     slippage: 0,
@@ -270,11 +301,9 @@ async function buildLocalPumpSwapBuyTransaction({ keypair, mint, amountSol, slip
   });
   let minimumMarketCapBaseAmountOut = new BN(0);
   if (entryGuard) {
-    const baseUnitScale = 10 ** Number(state.baseMintAccount.decimals);
-    const totalSupplyTokens = Number(state.baseMintAccount.supply.toString()) / baseUnitScale;
     const estimatedTokensOut = Number(quote.base.toString()) / baseUnitScale;
     const projectedFillMarketCapUsd = amountSol / estimatedTokensOut * totalSupplyTokens * entryGuard.solUsdPrice;
-    const projectedImpactPercent = (projectedFillMarketCapUsd / entryGuard.referenceMarketCapUsd - 1) * 100;
+    const projectedImpactPercent = (projectedFillMarketCapUsd / verifiedMarketCapUsd - 1) * 100;
     if (!Number.isFinite(projectedFillMarketCapUsd)
       || !Number.isFinite(projectedImpactPercent)
       || projectedFillMarketCapUsd > entryGuard.maximumMarketCapUsd) {
@@ -556,7 +585,7 @@ export function formatLiveExecutionDiagnostics(value: unknown) {
   ].filter(Boolean).join(" · ");
 }
 
-async function attemptTrade({ keypair, action, mint, amount, slippagePercent, pool, priorityFeeSol, knownBalanceSol, attempt, signalObservedAt, entryGuard }: { keypair: Keypair; action: "buy" | "sell"; mint: string; amount: number | string; slippagePercent: number; pool: "auto" | "pump" | "pump-amm"; priorityFeeSol: number; knownBalanceSol?: number; attempt: number; signalObservedAt?: number; entryGuard?: { referenceMarketCapUsd: number; maximumMarketCapUsd: number; solUsdPrice: number } }) {
+async function attemptTrade({ keypair, action, mint, amount, slippagePercent, pool, priorityFeeSol, knownBalanceSol, attempt, signalObservedAt, entryGuard }: { keypair: Keypair; action: "buy" | "sell"; mint: string; amount: number | string; slippagePercent: number; pool: "auto" | "pump" | "pump-amm"; priorityFeeSol: number; knownBalanceSol?: number; attempt: number; signalObservedAt?: number; entryGuard?: PumpSwapEntryGuard }) {
   const attemptStartedAt = performance.now();
   const diagnostics: LiveExecutionDiagnostics = {
     attempt,
@@ -694,7 +723,7 @@ export async function buildSignAndSendTrade({ keypair, action, mint, amount, sli
   pool?: "auto" | "pump" | "pump-amm";
   knownBalanceSol?: number;
   signalObservedAt?: number;
-  entryGuard?: { referenceMarketCapUsd: number; maximumMarketCapUsd: number; solUsdPrice: number };
+  entryGuard?: PumpSwapEntryGuard;
   freshTransactionRetries?: number;
   shouldRetryFreshTransaction?: () => Promise<boolean>;
   onFreshTransactionRetry?: (attempt: number, diagnostics?: LiveExecutionDiagnostics) => void;

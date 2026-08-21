@@ -1006,7 +1006,7 @@ export default function LockstepApp() {
     const triggerPoolLabel = triggerCandidate.observationPool
       ? triggerCandidate.observationPool === "pump-amm" ? "pump-amm" : `pump-amm (${shortAddress(triggerCandidate.observationPool)})`
       : "verified PumpSwap";
-    const triggerReceipt = `Trigger ${formatUsdMarketCap(triggerMarketCapUsd)} · ${triggerSourceLabel} · pool ${triggerPoolLabel}`;
+    const triggerReceipt = `${triggerCandidate.observationSource === "trade-stream" ? "PumpPortal reported" : "Trigger"} ${formatUsdMarketCap(triggerMarketCapUsd)} · ${triggerSourceLabel} · pool ${triggerPoolLabel}`;
     // Both websocket trades and completed HTTP polls are valid observations.
     // Re-fetch only after a signal has actually become stale; a duplicate
     // request here was adding enough latency for fast coins to leave the band.
@@ -1132,26 +1132,21 @@ export default function LockstepApp() {
           knownBalanceSol: freshBalance,
           signalObservedAt: Number(triggerCandidate.observedAt ?? Date.now()),
           entryGuard: {
-            referenceMarketCapUsd: executionMarketCapUsd,
+            reportedMarketCapUsd: triggerMarketCapUsd,
+            minimumMarketCapUsd: migrationExecutionSettings.boostEntryMinMarketCapUsd,
             maximumMarketCapUsd: migrationExecutionSettings.boostEntryMarketCapUsd,
             solUsdPrice,
           },
           freshTransactionRetries: 2,
           shouldRetryFreshTransaction: async () => {
-            if (Date.now() >= watchDeadline || engineModeRef.current !== "active" || strategyModeRef.current !== migrationMode || positionsRef.current.some((position) => position.mint === candidate.mint)) return false;
-            try {
-              const retryMark = await fetchPumpPrice(candidate.mint);
-              const retryMarketCapUsd = marketCapUsdFor(retryMark, solUsdPrice);
-              return !retryMark.isMayhemMode
-                && retryMark.isStandardPumpfunMigration === true
-                && retryMark.complete
-                && Boolean(retryMark.poolAddress)
-                && Number.isFinite(retryMarketCapUsd)
-                && retryMarketCapUsd >= migrationExecutionSettings.boostEntryMinMarketCapUsd
-                && retryMarketCapUsd <= migrationExecutionSettings.boostEntryMarketCapUsd;
-            } catch {
-              return false;
-            }
+            // Every rebuilt transaction repeats the authoritative on-chain
+            // reserve check in the same account read used for its fresh quote.
+            // An HTTP market-cap request here only added latency and could veto
+            // a valid retry using stale third-party data.
+            return Date.now() < watchDeadline
+              && engineModeRef.current === "active"
+              && strategyModeRef.current === migrationMode
+              && !positionsRef.current.some((position) => position.mint === candidate.mint);
           },
           onFreshTransactionRetry: (attempt, diagnostics) => addExecutionActivity(`Retrying ${candidate.symbol}`, `${triggerReceipt} · PumpSwap slippage rejected the previous quote${diagnostics ? ` · ${formatLiveExecutionDiagnostics(diagnostics)}` : ""} · rebuilding fresh transaction (${attempt}/3)`, "neutral", candidate.mint),
           onExecutionDiagnostics: (diagnostics) => { executionDetail = formatLiveExecutionDiagnostics(diagnostics); },
