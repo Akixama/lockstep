@@ -128,7 +128,10 @@ test("Fresh per-token trades trigger immediately and USD market cap falls back t
   assert.match(source, /warmPumpSwapBuy\(candidate\.mint, keypairRef\.current\.publicKey\)/);
   assert.match(source, /streamedMark\.symbol === "MIG" \? candidate\.symbol/);
   assert.match(tradingSource, /buildLocalPumpSwapBuyTransaction/);
-  assert.match(tradingSource, /PUMP_AMM_SDK\.buyQuoteInput/);
+  assert.match(tradingSource, /PUMP_AMM_SDK\.buyInstructions/);
+  assert.match(tradingSource, /"buyExactQuoteIn"/);
+  assert.match(tradingSource, /spendableQuoteIn/);
+  assert.match(tradingSource, /minBaseAmountOut/);
   assert.match(tradingSource, /knownBalanceSol/);
   assert.match(source, /Date\.now\(\) - Number\(triggerCandidate\.observedAt\) <= LIVE_QUOTE_MAX_AGE_MS/);
   assert.doesNotMatch(source, /stream-confirm:/);

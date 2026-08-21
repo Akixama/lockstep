@@ -2,7 +2,7 @@
 
 import { AccountLayout } from "@solana/spl-token";
 import type { OnlinePumpAmmSdk, SwapSolanaState } from "@pump-fun/pump-swap-sdk";
-import { ComputeBudgetProgram, Connection, Keypair, PublicKey, TransactionMessage, VersionedTransaction } from "@solana/web3.js";
+import { ComputeBudgetProgram, Connection, Keypair, PublicKey, TransactionInstruction, TransactionMessage, VersionedTransaction } from "@solana/web3.js";
 import BN from "bn.js";
 
 export type LaunchCandidate = {
@@ -251,7 +251,37 @@ async function buildLocalPumpSwapBuyTransaction({ keypair, mint, amountSol, slip
   };
   const quoteLamports = Math.round(amountSol * LAMPORTS_PER_SOL);
   if (!Number.isSafeInteger(quoteLamports) || quoteLamports <= 0) throw new Error("The local PumpSwap order amount was invalid");
-  const buyInstructions = await pumpSwapModule.PUMP_AMM_SDK.buyQuoteInput(freshState, new BN(quoteLamports), slippagePercent);
+  const spendableQuoteIn = new BN(quoteLamports);
+  const quote = pumpSwapModule.buyQuoteInput({
+    quote: spendableQuoteIn,
+    slippage: 0,
+    baseReserve: poolBaseAmount,
+    quoteReserve: poolQuoteAmount,
+    virtualQuoteReserves: pool.virtualQuoteReserves,
+    globalConfig: state.globalConfig,
+    baseMintAccount: state.baseMintAccount,
+    baseMint: state.baseMint,
+    coinCreator: pool.coinCreator,
+    creator: pool.creator,
+    feeConfig: state.feeConfig,
+  });
+  const slippageScale = 100_000_000;
+  const slippageUnits = Math.min(slippageScale, Math.max(0, Math.floor(slippagePercent * 1_000_000)));
+  const minBaseAmountOut = quote.base.mul(new BN(slippageScale - slippageUnits)).div(new BN(slippageScale));
+  const buyInstructions = await pumpSwapModule.PUMP_AMM_SDK.buyInstructions(freshState, quote.base, spendableQuoteIn);
+  const buyInstructionIndex = buyInstructions.findIndex((instruction) =>
+    instruction.programId.toBase58() === PUMP_AMM_PROGRAM && instruction.data.length > 8);
+  if (buyInstructionIndex < 0) throw new Error("The local builder could not locate the PumpSwap buy instruction");
+  const originalBuyInstruction = buyInstructions[buyInstructionIndex];
+  buyInstructions[buyInstructionIndex] = new TransactionInstruction({
+    programId: originalBuyInstruction.programId,
+    keys: originalBuyInstruction.keys,
+    data: pumpSwapModule.OFFLINE_PUMP_AMM_PROGRAM.coder.instruction.encode("buyExactQuoteIn", {
+      spendableQuoteIn,
+      minBaseAmountOut,
+      trackVolume: { 0: true },
+    }),
+  });
   const microLamportsPerUnit = Math.max(1, Math.ceil(priorityFeeSol * LAMPORTS_PER_SOL * 1_000_000 / ESTIMATED_COMPUTE_UNITS));
   const message = new TransactionMessage({
     payerKey: keypair.publicKey,
