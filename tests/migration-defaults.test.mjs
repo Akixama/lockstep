@@ -165,6 +165,8 @@ test("Live execution broadcasts one signed transaction across RPC routes and rec
   const rpcRouteSource = await readFile(rpcRouteSourceUrl, "utf8");
 
   assert.match(rpcRouteSource, /body\.method === "sendTransaction"/);
+  assert.match(rpcRouteSource, /id: requestId/);
+  assert.match(rpcRouteSource, /body\.id \?\? 1/);
   assert.match(rpcRouteSource, /Promise\.any\(submissions\)/);
   assert.match(rpcRouteSource, /routesAttempted: RPC_URLS\.length/);
   assert.match(rpcRouteSource, /same Solana signature/);
@@ -173,6 +175,7 @@ test("Live execution broadcasts one signed transaction across RPC routes and rec
   assert.match(tradingSource, /build \$\{formatDuration\(detail\.buildMs\)\}/);
   assert.match(tradingSource, /submit \$\{formatDuration\(detail\.submitMs\)\} via \$\{route\}/);
   assert.match(tradingSource, /onExecutionDiagnostics/);
+  assert.match(tradingSource, /builderFallbackReason/);
   assert.match(source, /formatLiveExecutionDiagnostics\(diagnostics\)/g);
   assert.match(source, /signalObservedAt: Number\(triggerCandidate\.observedAt/);
 });

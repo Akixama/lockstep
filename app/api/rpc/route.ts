@@ -17,7 +17,8 @@ const RPC_URLS = [
   "https://api.mainnet-beta.solana.com",
 ].filter((url, index, urls): url is string => Boolean(url) && urls.indexOf(url) === index);
 
-type RpcPayload = { result?: unknown; error?: unknown };
+type RpcId = string | number | null;
+type RpcPayload = { jsonrpc?: string; id?: RpcId; result?: unknown; error?: unknown };
 
 class RpcPayloadError extends Error {
   payload: RpcPayload;
@@ -32,14 +33,18 @@ function rpcRouteLabel(url: string) {
   try { return new URL(url).hostname; } catch { return "solana-rpc"; }
 }
 
-async function callRpc(url: string, method: string, params: unknown[]) {
+async function callRpc(url: string, method: string, params: unknown[], requestId: RpcId) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 4_500);
   try {
     const response = await fetch(url, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+      // @solana/web3.js uses a string request id and validates that the
+      // response echoes it. Replacing it with numeric `1` made otherwise
+      // valid getMultipleAccounts responses fail client-side validation,
+      // which silently forced PumpSwap buys onto the slower remote builder.
+      body: JSON.stringify({ jsonrpc: "2.0", id: requestId, method, params }),
       signal: controller.signal,
     });
     const payload = await response.json() as RpcPayload;
@@ -52,7 +57,7 @@ async function callRpc(url: string, method: string, params: unknown[]) {
 
 export async function POST(request: NextRequest) {
   try {
-    const body = await request.json() as { method?: string; params?: unknown[] };
+    const body = await request.json() as { id?: RpcId; method?: string; params?: unknown[] };
     if (!body.method || !ALLOWED_METHODS.has(body.method)) {
       return NextResponse.json({ error: "RPC method is not allowed" }, { status: 400 });
     }
@@ -62,7 +67,7 @@ export async function POST(request: NextRequest) {
     // slow-provider waterfall from the latency-critical landing path.
     if (body.method === "sendTransaction") {
       const submissions = RPC_URLS.map(async (rpcUrl) => {
-        const payload = await callRpc(rpcUrl, body.method!, body.params ?? []);
+        const payload = await callRpc(rpcUrl, body.method!, body.params ?? [], body.id ?? 1);
         if (payload.error) throw new RpcPayloadError(payload);
         return { payload, route: rpcRouteLabel(rpcUrl) };
       });
@@ -83,7 +88,7 @@ export async function POST(request: NextRequest) {
     let rpcError: RpcPayload | null = null;
     for (const rpcUrl of RPC_URLS) {
       try {
-        const payload = await callRpc(rpcUrl, body.method, body.params ?? []);
+        const payload = await callRpc(rpcUrl, body.method, body.params ?? [], body.id ?? 1);
         if (payload.error) {
           rpcError ??= payload;
           continue;

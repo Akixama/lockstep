@@ -78,6 +78,7 @@ export type PaperBuyBuild = { transactionBytes: number };
 export type LiveExecutionDiagnostics = {
   attempt: number;
   builder: "local-pumpswap" | "remote" | "remote-fallback" | "unknown";
+  builderFallbackReason?: string;
   buildMs: number;
   signMs: number;
   fundingCheckMs: number;
@@ -479,6 +480,7 @@ export function formatLiveExecutionDiagnostics(value: unknown) {
     : `${Math.max(1, detail.routesAttempted)} RPC route${detail.acceptedBy ? `, ${detail.acceptedBy}` : ""}`;
   return [
     `execution ${detail.builder}`,
+    detail.builderFallbackReason ? `local builder: ${detail.builderFallbackReason}` : "",
     `attempt ${detail.attempt}`,
     detail.signalToSubmitMs === undefined ? "" : `signal→send ${formatDuration(detail.signalToSubmitMs)}`,
     `build ${formatDuration(detail.buildMs)}`,
@@ -530,10 +532,11 @@ async function attemptTrade({ keypair, action, mint, amount, slippagePercent, po
       try {
         diagnostics.builder = "local-pumpswap";
         transaction = await buildLocalPumpSwapBuyTransaction({ keypair, mint, amountSol: amount, slippagePercent, priorityFeeSol });
-      } catch {
+      } catch (error) {
         // Preserve availability if a newly migrated pool is not indexed by the
         // read RPC yet. The existing PumpPortal builder remains a safe fallback.
         diagnostics.builder = "remote-fallback";
+        diagnostics.builderFallbackReason = (error instanceof Error ? error.message : stringifyTradeError(error)).slice(0, 140);
         transaction = await buildRemoteTradeTransaction({ keypair, action, mint, amount, slippagePercent, pool, priorityFeeSol });
       }
     } else {
