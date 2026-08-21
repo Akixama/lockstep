@@ -30,7 +30,7 @@ test("Migration Paper starts from its confirmed defaults instead of legacy setti
   assert.match(source, /streamedMarketCapUsd >= migrationExecutionSettings\.boostEntryMinMarketCapUsd/);
   assert.match(source, /marketCapUsd >= migrationExecutionSettings\.boostEntryMinMarketCapUsd/);
   assert.match(source, /outside \$\{rugTriggerLabel\}/);
-  assert.match(source, /Shared live stream \+ backup polling/);
+  assert.match(source, /Processed WebSocket \+ shared trade stream \+ backup polling/);
   assert.doesNotMatch(source, /PUMPPORTAL API KEY/);
   assert.doesNotMatch(source, /PUMPPORTAL_API_KEY/);
   assert.match(source, /nextSliceAt: completedAt \+ current\.paperExitPlan\.intervalSeconds \* 1000/);
@@ -73,6 +73,7 @@ test("Migration feed consumes the protected server relay for metered token trade
   assert.match(source, /const watchTokenTrades: TokenTradeWatcher =/);
   assert.match(source, /isPostMigrationTradePool\(data\.pool\)/);
   assert.match(source, /observationSource: "trade-stream"/);
+  assert.match(source, /data\.signalOnly === true && data\.source === "helius-processed"/);
   assert.match(routeSource, /process\.env\.PUMPPORTAL_API_KEY/);
   assert.match(routeSource, /MAX_STREAMS_PER_IP/);
   assert.match(routeSource, /const MAX_STREAMS_PER_IP = 32/);
@@ -105,6 +106,10 @@ test("Persistent relay keeps one protected PumpPortal connection warm", async ()
   assert.match(source, /url\.pathname === "\/health"/);
   assert.match(source, /url\.pathname !== "\/trades"/);
   assert.match(source, /url\.searchParams\.getAll\("mint"\)/);
+  assert.match(source, /method: "logsSubscribe"/);
+  assert.match(source, /commitment: "processed"/);
+  assert.match(source, /signalOnly: true/);
+  assert.match(source, /SOLANA_WS_URL/);
 });
 
 test("Fresh per-token trades trigger immediately and USD market cap falls back to SOL", async () => {
@@ -114,7 +119,7 @@ test("Fresh per-token trades trigger immediately and USD market cap falls back t
   assert.match(source, /function marketCapUsdFor/);
   assert.match(source, /marketCapSol \* solUsdPrice/);
   assert.match(source, /triggerCandidate = \{\s*\.\.\.candidate,\s*\.\.\.streamedMark,/);
-  assert.match(source, /observationSource: "poll"/);
+  assert.match(source, /observationSource: Date\.now\(\) - processedSignalAt <= LIVE_QUOTE_MAX_AGE_MS \? "processed-signal" : "poll"/);
   assert.match(source, /confirmedPostMigrationPoll = mark\.complete/);
   assert.match(source, /Boolean\(mark\.poolAddress\)/);
   assert.match(source, /triggerReceipt/);
@@ -124,13 +129,15 @@ test("Fresh per-token trades trigger immediately and USD market cap falls back t
   assert.match(tradingSource, /Projected average fill/);
   assert.match(tradingSource, /exceeds the \$\$\{entryGuard\.maximumMarketCapUsd\.toFixed\(0\)\} MC strategy maximum/);
   assert.match(tradingSource, /minimumMarketCapBaseAmountOut\.gt\(slippageMinBaseAmountOut\)/);
-  assert.match(tradingSource, /minimumTokensOut = amountSol \* 1_000_000_000 \* entryGuard\.solUsdPrice \/ entryGuard\.maximumMarketCapUsd/);
+  assert.match(tradingSource, /totalSupplyTokens = Number\(state\.baseMintAccount\.supply\.toString\(\)\) \/ baseUnitScale/);
+  assert.match(tradingSource, /minimumTokensOut = amountSol \* totalSupplyTokens \* entryGuard\.solUsdPrice \/ entryGuard\.maximumMarketCapUsd/);
   assert.doesNotMatch(source, /Maximum entry impact/);
   assert.match(tradingSource, /Entry protection could not verify a fresh PumpSwap fill/);
   assert.match(source, /Live entry protected/);
   assert.match(source, /instanceof LiveTradeEntryGuardError/);
   assert.match(source, /PumpPortal live trade/);
   assert.match(source, /verified backup poll/);
+  assert.match(source, /processed WebSocket signal/);
   assert.match(source, /freshTrigger/);
   assert.match(source, /watchTokenTrades\?\.\(\s*unverifiedCandidate\.mint/);
   assert.match(source, /live feed unavailable/);
@@ -232,6 +239,7 @@ test("Live priority fee lookup is warmed outside the buy path", async () => {
   assert.match(tradingSource, /PRIORITY_FEE_CACHE_MS/);
   assert.match(tradingSource, /DEFAULT_PRIORITY_FEE_SOL = 0\.01/);
   assert.match(tradingSource, /MIN_LIVE_PRIORITY_FEE_SOL = 0\.01/);
+  assert.match(tradingSource, /MAX_LIVE_PRIORITY_FEE_SOL = 0\.06/);
   assert.match(source, /PAPER_PRIORITY_FEE_SOL = 0\.01/);
   assert.match(tradingSource, /getCachedCompetitivePriorityFeeSol\(\)/);
   assert.match(tradingSource, /export function warmLiveTradePreparation/);

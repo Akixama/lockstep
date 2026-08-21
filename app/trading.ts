@@ -20,7 +20,7 @@ export type LaunchCandidate = {
   boostMode?: string;
   isStandardPumpfunMigration?: boolean;
   observedAt?: number;
-  observationSource?: "trade-stream" | "poll";
+  observationSource?: "trade-stream" | "processed-signal" | "poll";
   observationPool?: string;
 };
 
@@ -95,6 +95,7 @@ export type TokenTradeWatcher = (
   mint: string,
   onTrade: (mark: LaunchCandidate) => void,
   onStatus?: (status: TokenTradeStreamStatus) => void,
+  onProcessedSignal?: () => void,
 ) => () => void;
 
 const LAMPORTS_PER_SOL = 1_000_000_000;
@@ -109,7 +110,7 @@ const CREATOR_FEE_BPS = 30n;
 // network competition instead.
 const DEFAULT_PRIORITY_FEE_SOL = 0.01;
 const MIN_LIVE_PRIORITY_FEE_SOL = 0.01;
-const MAX_LIVE_PRIORITY_FEE_SOL = 0.02; // hard cap so a fee spike can't eat the order
+const MAX_LIVE_PRIORITY_FEE_SOL = 0.06; // user-approved hard cap for highly competitive migration blocks
 const ESTIMATED_COMPUTE_UNITS = 300_000;
 const PRIORITY_FEE_CACHE_MS = 15_000;
 const PUMP_SWAP_PREPARATION_TTL_MS = 5 * 60_000;
@@ -270,8 +271,9 @@ async function buildLocalPumpSwapBuyTransaction({ keypair, mint, amountSol, slip
   let minimumMarketCapBaseAmountOut = new BN(0);
   if (entryGuard) {
     const baseUnitScale = 10 ** Number(state.baseMintAccount.decimals);
+    const totalSupplyTokens = Number(state.baseMintAccount.supply.toString()) / baseUnitScale;
     const estimatedTokensOut = Number(quote.base.toString()) / baseUnitScale;
-    const projectedFillMarketCapUsd = amountSol / estimatedTokensOut * 1_000_000_000 * entryGuard.solUsdPrice;
+    const projectedFillMarketCapUsd = amountSol / estimatedTokensOut * totalSupplyTokens * entryGuard.solUsdPrice;
     const projectedImpactPercent = (projectedFillMarketCapUsd / entryGuard.referenceMarketCapUsd - 1) * 100;
     if (!Number.isFinite(projectedFillMarketCapUsd)
       || !Number.isFinite(projectedImpactPercent)
@@ -280,7 +282,7 @@ async function buildLocalPumpSwapBuyTransaction({ keypair, mint, amountSol, slip
         `Projected average fill $${projectedFillMarketCapUsd.toFixed(0)} MC · ${Math.max(0, projectedImpactPercent).toFixed(1)}% above trigger exceeds the $${entryGuard.maximumMarketCapUsd.toFixed(0)} MC strategy maximum`,
       );
     }
-    const minimumTokensOut = amountSol * 1_000_000_000 * entryGuard.solUsdPrice / entryGuard.maximumMarketCapUsd;
+    const minimumTokensOut = amountSol * totalSupplyTokens * entryGuard.solUsdPrice / entryGuard.maximumMarketCapUsd;
     const minimumRawBaseAmountOut = Math.ceil(minimumTokensOut * baseUnitScale);
     if (!Number.isSafeInteger(minimumRawBaseAmountOut) || minimumRawBaseAmountOut <= 0) {
       throw new LiveTradeEntryGuardError("Entry protection could not calculate the strategy's maximum confirmed fill");
@@ -1057,6 +1059,7 @@ export function openMigrationFeed(
   type TradeListener = {
     onTrade: (mark: LaunchCandidate) => void;
     onStatus?: (status: TokenTradeStreamStatus) => void;
+    onProcessedSignal?: () => void;
   };
   const tradeListeners = new Map<string, Set<TradeListener>>();
   let activeTradeStream: EventSource | null = null;
@@ -1074,6 +1077,10 @@ export function openMigrationFeed(
       const data = JSON.parse(String(event.data)) as Record<string, unknown>;
       const mint = typeof data.mint === "string" ? data.mint : "";
       const listeners = tradeListeners.get(mint);
+      if (data.signalOnly === true && data.source === "helius-processed") {
+        listeners?.forEach((listener) => listener.onProcessedSignal?.());
+        return;
+      }
       const marketCapSol = Number(data.marketCapSol);
       const marketCapUsd = Number(data.marketCapUsd);
       // subscribeTokenTrade covers every venue for a mint. Migration mode
@@ -1165,8 +1172,8 @@ export function openMigrationFeed(
   // Metered token trades are relayed by our server so the funded PumpPortal
   // key never reaches a visitor's browser. The shared stream prevents one
   // five-minute connection per watched coin from exhausting the per-IP cap.
-  const watchTokenTrades: TokenTradeWatcher = (mint, onTrade, onStatus) => {
-    const listener: TradeListener = { onTrade, onStatus };
+  const watchTokenTrades: TokenTradeWatcher = (mint, onTrade, onStatus, onProcessedSignal) => {
+    const listener: TradeListener = { onTrade, onStatus, onProcessedSignal };
     let listeners = tradeListeners.get(mint);
     if (!listeners) {
       listeners = new Set();

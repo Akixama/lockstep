@@ -815,6 +815,7 @@ export default function LockstepApp() {
     // through the configured entry band.
     const streamedMarks: LaunchCandidate[] = [];
     let wakeStreamWait: (() => void) | null = null;
+    let processedSignalAt = 0;
     let relayFailureReported = false;
     const stopTradeWatch = watchTokenTrades?.(
       unverifiedCandidate.mint,
@@ -831,10 +832,14 @@ export default function LockstepApp() {
         relayFailureReported = true;
         addExecutionActivity(
           `${unverifiedCandidate.symbol} live feed unavailable`,
-          "The shared PumpPortal stream could not connect · backup polling remains active for this watch",
+          "The shared processed/live stream could not connect · backup polling remains active for this watch",
           "warn",
           unverifiedCandidate.mint,
         );
+      },
+      () => {
+        processedSignalAt = Date.now();
+        wakeStreamWait?.();
       },
     );
     const waitForTradeOrFallback = () => new Promise<void>((resolve) => {
@@ -895,7 +900,7 @@ export default function LockstepApp() {
     const migrationStartedAt = Date.now() - Math.max(0, migrationAge) * 1000;
     const watchDeadline = migrationStartedAt + MIGRATION_WINDOW_SECONDS * 1000;
     const rugTriggerLabel = `${formatUsdMarketCap(migrationExecutionSettings.boostEntryMinMarketCapUsd)}–${formatUsdMarketCap(migrationExecutionSettings.boostEntryMarketCapUsd)}`;
-    addExecutionActivity(`${candidate.symbol} BOOST watch`, `${watchTokenTrades ? "Shared live stream + backup polling" : "Backup polling"} for up to ${Math.max(0, Math.ceil((watchDeadline - Date.now()) / 1000))}s · waiting for the coin to enter ${rugTriggerLabel}`, "neutral", candidate.mint);
+    addExecutionActivity(`${candidate.symbol} BOOST watch`, `${watchTokenTrades ? "Processed WebSocket + shared trade stream + backup polling" : "Backup polling"} for up to ${Math.max(0, Math.ceil((watchDeadline - Date.now()) / 1000))}s · waiting for the coin to enter ${rugTriggerLabel}`, "neutral", candidate.mint);
     // LOGGING: every price check this watch performs (stream-confirm or
     // direct poll, success or failure) is now written to console so a
     // watch's full price history is searchable in Vercel's function logs by
@@ -970,7 +975,7 @@ export default function LockstepApp() {
             marketCapSol: mark.marketCapSol,
             marketCapUsd,
             observedAt: mark.quotedAt,
-            observationSource: "poll",
+            observationSource: Date.now() - processedSignalAt <= LIVE_QUOTE_MAX_AGE_MS ? "processed-signal" : "poll",
             observationPool: mark.poolAddress,
           };
           break;
@@ -993,7 +998,11 @@ export default function LockstepApp() {
       return;
     }
     const triggerMarketCapUsd = Number(triggerCandidate.marketCapUsd);
-    const triggerSourceLabel = triggerCandidate.observationSource === "trade-stream" ? "PumpPortal live trade" : "verified backup poll";
+    const triggerSourceLabel = triggerCandidate.observationSource === "trade-stream"
+      ? "PumpPortal live trade"
+      : triggerCandidate.observationSource === "processed-signal"
+        ? "processed WebSocket signal"
+        : "verified backup poll";
     const triggerPoolLabel = triggerCandidate.observationPool
       ? triggerCandidate.observationPool === "pump-amm" ? "pump-amm" : `pump-amm (${shortAddress(triggerCandidate.observationPool)})`
       : "verified PumpSwap";
