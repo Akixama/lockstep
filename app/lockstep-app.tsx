@@ -785,6 +785,10 @@ export default function LockstepApp() {
     const stopTradeWatch = watchTokenTrades?.(
       unverifiedCandidate.mint,
       (mark) => {
+        // Only the newest streamed price is useful for a fast-moving token.
+        // Retaining older frames can make execution act on a market cap that
+        // has already been replaced by several newer trades.
+        streamedMarks.length = 0;
         streamedMarks.push(mark);
         wakeStreamWait?.();
       },
@@ -801,15 +805,37 @@ export default function LockstepApp() {
     );
     const waitForTradeOrFallback = () => new Promise<void>((resolve) => {
       let settled = false;
+      let timer: number | null = null;
       const finish = () => {
         if (settled) return;
         settled = true;
-        wakeStreamWait = null;
+        if (timer !== null) window.clearTimeout(timer);
+        if (wakeStreamWait === finish) wakeStreamWait = null;
         resolve();
       };
       wakeStreamWait = finish;
-      window.setTimeout(finish, MIGRATION_WATCH_POLL_MS);
+      timer = window.setTimeout(finish, MIGRATION_WATCH_POLL_MS);
     });
+    const createTradeInterrupt = () => {
+      let active = true;
+      let finish: (() => void) | null = null;
+      const promise = new Promise<"trade-stream">((resolve) => {
+        finish = () => {
+          if (!active) return;
+          active = false;
+          if (wakeStreamWait === finish) wakeStreamWait = null;
+          resolve("trade-stream");
+        };
+        wakeStreamWait = finish;
+      });
+      return {
+        promise,
+        cancel: () => {
+          active = false;
+          if (wakeStreamWait === finish) wakeStreamWait = null;
+        },
+      };
+    };
     let candidate: LaunchCandidate;
     let migrationAge = 0;
     try {
@@ -852,7 +878,7 @@ export default function LockstepApp() {
     // observed mark inside [boostEntryMinMarketCapUsd, boostEntryMarketCapUsd],
     // spike or no spike.
     while (Date.now() < watchDeadline && engineModeRef.current === "active" && strategyModeRef.current === migrationMode) {
-      const streamedMark = streamedMarks.shift();
+      const streamedMark = streamedMarks.pop();
       if (streamedMark) {
         const streamedMarketCapUsd = marketCapUsdFor(streamedMark, solUsdPrice);
         const crossedRugTrigger = Number.isFinite(streamedMarketCapUsd)
@@ -869,8 +895,21 @@ export default function LockstepApp() {
         }
         continue;
       }
-      try {
-        const mark = await fetchPumpPrice(candidate.mint);
+      const pollController = new AbortController();
+      const tradeInterrupt = createTradeInterrupt();
+      const pollResult = fetchPumpPrice(candidate.mint, pollController.signal)
+        .then((mark) => ({ source: "poll" as const, mark }))
+        .catch((error: unknown) => ({ source: "poll-error" as const, error }));
+      const observation = await Promise.race([pollResult, tradeInterrupt.promise]);
+      if (observation === "trade-stream") {
+        // A live frame arrived while the HTTP price request was in flight.
+        // Cancel the slower request and process the newest live mark first.
+        pollController.abort();
+        continue;
+      }
+      tradeInterrupt.cancel();
+      if (observation.source === "poll") {
+        const mark = observation.mark;
         const marketCapUsd = marketCapUsdFor(mark, solUsdPrice);
         const confirmedPostMigrationPoll = mark.complete
           && Boolean(mark.poolAddress)
@@ -895,7 +934,8 @@ export default function LockstepApp() {
           };
           break;
         }
-      } catch (err) {
+      } else {
+        const err = observation.error;
         console.log(`[BOOST watch] ${candidate.mint} (${candidate.symbol}) poll FAILED: ${err instanceof Error ? err.message : String(err)} t=${new Date().toISOString()}`);
         /* keep watching through transient API failures */
       }

@@ -455,8 +455,8 @@ async function waitForConfirmation(signature: string) {
   throw new LiveTradeError(`Transaction confirmation timed out: ${signature}`, { signature });
 }
 
-export async function fetchPumpPrice(mint: string) {
-  const response = await fetch(`/api/price?mint=${encodeURIComponent(mint)}`, { cache: "no-store" });
+export async function fetchPumpPrice(mint: string, signal?: AbortSignal) {
+  const response = await fetch(`/api/price?mint=${encodeURIComponent(mint)}`, { cache: "no-store", signal });
   const payload = await response.json();
   if (!response.ok) throw new Error(payload.error ?? "Price unavailable");
   const coin = payload.data && typeof payload.data === "object" ? payload.data : payload;

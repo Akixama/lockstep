@@ -103,6 +103,7 @@ test("Persistent relay keeps one protected PumpPortal connection warm", async ()
 
 test("Fresh per-token trades trigger immediately and USD market cap falls back to SOL", async () => {
   const source = await readFile(sourceUrl, "utf8");
+  const tradingSource = await readFile(tradingSourceUrl, "utf8");
 
   assert.match(source, /function marketCapUsdFor/);
   assert.match(source, /marketCapSol \* solUsdPrice/);
@@ -117,6 +118,10 @@ test("Fresh per-token trades trigger immediately and USD market cap falls back t
   assert.match(source, /watchTokenTrades\?\.\(\s*unverifiedCandidate\.mint/);
   assert.match(source, /live feed unavailable/);
   assert.match(source, /buffer frames while the/);
+  assert.match(source, /streamedMarks\.length = 0/);
+  assert.match(source, /Promise\.race\(\[pollResult, tradeInterrupt\.promise\]\)/);
+  assert.match(source, /pollController\.abort\(\)/);
+  assert.match(tradingSource, /fetchPumpPrice\(mint: string, signal\?: AbortSignal\)/);
   assert.match(source, /Date\.now\(\) - Number\(triggerCandidate\.observedAt\) <= LIVE_QUOTE_MAX_AGE_MS/);
   assert.doesNotMatch(source, /stream-confirm:/);
   assert.doesNotMatch(source, /After execution latency/);
