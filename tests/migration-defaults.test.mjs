@@ -230,6 +230,9 @@ test("Live priority fee lookup is warmed outside the buy path", async () => {
   const tradingSource = await readFile(tradingSourceUrl, "utf8");
 
   assert.match(tradingSource, /PRIORITY_FEE_CACHE_MS/);
+  assert.match(tradingSource, /DEFAULT_PRIORITY_FEE_SOL = 0\.01/);
+  assert.match(tradingSource, /MIN_LIVE_PRIORITY_FEE_SOL = 0\.01/);
+  assert.match(source, /PAPER_PRIORITY_FEE_SOL = 0\.01/);
   assert.match(tradingSource, /getCachedCompetitivePriorityFeeSol\(\)/);
   assert.match(tradingSource, /export function warmLiveTradePreparation/);
   assert.doesNotMatch(tradingSource, /priorityFeeSol = await fetchCompetitivePriorityFeeSol/);

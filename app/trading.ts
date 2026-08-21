@@ -107,8 +107,8 @@ const CREATOR_FEE_BPS = 30n;
 // A flat priority fee loses that race whenever network demand rises above
 // the fixed bid. These constants bound a fee that adapts to real recent
 // network competition instead.
-const DEFAULT_PRIORITY_FEE_SOL = 0.0005;
-const MIN_LIVE_PRIORITY_FEE_SOL = 0.0005;
+const DEFAULT_PRIORITY_FEE_SOL = 0.01;
+const MIN_LIVE_PRIORITY_FEE_SOL = 0.01;
 const MAX_LIVE_PRIORITY_FEE_SOL = 0.02; // hard cap so a fee spike can't eat the order
 const ESTIMATED_COMPUTE_UNITS = 300_000;
 const PRIORITY_FEE_CACHE_MS = 15_000;
