@@ -267,8 +267,10 @@ async function buildLocalPumpSwapBuyTransaction({ keypair, mint, amountSol, slip
     creator: pool.creator,
     feeConfig: state.feeConfig,
   });
+  let minimumMarketCapBaseAmountOut = new BN(0);
   if (entryGuard) {
-    const estimatedTokensOut = Number(quote.base.toString()) / (10 ** Number(state.baseMintAccount.decimals));
+    const baseUnitScale = 10 ** Number(state.baseMintAccount.decimals);
+    const estimatedTokensOut = Number(quote.base.toString()) / baseUnitScale;
     const projectedFillMarketCapUsd = amountSol / estimatedTokensOut * 1_000_000_000 * entryGuard.solUsdPrice;
     const projectedImpactPercent = (projectedFillMarketCapUsd / entryGuard.referenceMarketCapUsd - 1) * 100;
     if (!Number.isFinite(projectedFillMarketCapUsd)
@@ -278,10 +280,19 @@ async function buildLocalPumpSwapBuyTransaction({ keypair, mint, amountSol, slip
         `Projected average fill $${projectedFillMarketCapUsd.toFixed(0)} MC · ${Math.max(0, projectedImpactPercent).toFixed(1)}% above trigger exceeds the $${entryGuard.maximumMarketCapUsd.toFixed(0)} MC strategy maximum`,
       );
     }
+    const minimumTokensOut = amountSol * 1_000_000_000 * entryGuard.solUsdPrice / entryGuard.maximumMarketCapUsd;
+    const minimumRawBaseAmountOut = Math.ceil(minimumTokensOut * baseUnitScale);
+    if (!Number.isSafeInteger(minimumRawBaseAmountOut) || minimumRawBaseAmountOut <= 0) {
+      throw new LiveTradeEntryGuardError("Entry protection could not calculate the strategy's maximum confirmed fill");
+    }
+    minimumMarketCapBaseAmountOut = new BN(minimumRawBaseAmountOut.toString());
   }
   const slippageScale = 100_000_000;
   const slippageUnits = Math.min(slippageScale, Math.max(0, Math.floor(slippagePercent * 1_000_000)));
-  const minBaseAmountOut = quote.base.mul(new BN(slippageScale - slippageUnits)).div(new BN(slippageScale));
+  const slippageMinBaseAmountOut = quote.base.mul(new BN(slippageScale - slippageUnits)).div(new BN(slippageScale));
+  const minBaseAmountOut = minimumMarketCapBaseAmountOut.gt(slippageMinBaseAmountOut)
+    ? minimumMarketCapBaseAmountOut
+    : slippageMinBaseAmountOut;
   const buyInstructions = await pumpSwapModule.PUMP_AMM_SDK.buyInstructions(freshState, quote.base, spendableQuoteIn);
   const buyInstructionIndex = buyInstructions.findIndex((instruction) =>
     instruction.programId.toBase58() === PUMP_AMM_PROGRAM && instruction.data.length > 8);

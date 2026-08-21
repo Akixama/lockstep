@@ -123,6 +123,8 @@ test("Fresh per-token trades trigger immediately and USD market cap falls back t
   assert.match(source, /maximumMarketCapUsd:\s*migrationExecutionSettings\.boostEntryMarketCapUsd/);
   assert.match(tradingSource, /Projected average fill/);
   assert.match(tradingSource, /exceeds the \$\$\{entryGuard\.maximumMarketCapUsd\.toFixed\(0\)\} MC strategy maximum/);
+  assert.match(tradingSource, /minimumMarketCapBaseAmountOut\.gt\(slippageMinBaseAmountOut\)/);
+  assert.match(tradingSource, /minimumTokensOut = amountSol \* 1_000_000_000 \* entryGuard\.solUsdPrice \/ entryGuard\.maximumMarketCapUsd/);
   assert.doesNotMatch(source, /Maximum entry impact/);
   assert.match(tradingSource, /Entry protection could not verify a fresh PumpSwap fill/);
   assert.match(source, /Live entry protected/);
