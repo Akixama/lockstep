@@ -9,7 +9,7 @@ import { gcm } from "@noble/ciphers/aes";
 import { pbkdf2Async } from "@noble/hashes/pbkdf2";
 import { sha256 } from "@noble/hashes/sha256";
 import { utf8ToBytes } from "@noble/hashes/utils";
-import { buildExactPaperBuy, buildSignAndSendTrade, describeLiveTradeFailure, fetchLiveBuyQuote, fetchPumpPrice, isRetryableLiveTradeFailure, openLaunchFeed, openMigrationFeed, verifyMigrationCandidate, warmLiveTradePreparation, type LaunchCandidate, type LivePosition, type TokenTradeWatcher } from "./trading";
+import { buildExactPaperBuy, buildSignAndSendTrade, describeLiveTradeFailure, fetchLiveBuyQuote, fetchPumpPrice, isRetryableLiveTradeFailure, openLaunchFeed, openMigrationFeed, verifyMigrationCandidate, warmLiveTradePreparation, warmPumpSwapBuy, type LaunchCandidate, type LivePosition, type TokenTradeWatcher } from "./trading";
 
 type StoredWallet = {
   version: 1;
@@ -635,6 +635,7 @@ export default function LockstepApp() {
         mint: candidate.mint,
         amount: quote.amountSol,
         slippagePercent: newPairsSettings.slippage,
+        knownBalanceSol: freshBalance,
         freshTransactionRetries: 2,
         shouldRetryFreshTransaction: async () => {
           if (engineModeRef.current !== "active" || strategyModeRef.current !== "new-pairs-live" || positionsRef.current.some((position) => position.mint === candidate.mint)) return false;
@@ -842,6 +843,7 @@ export default function LockstepApp() {
       const verified = await verifyMigrationCandidate(unverifiedCandidate, MIGRATION_WINDOW_SECONDS);
       candidate = verified.candidate;
       migrationAge = verified.ageSeconds;
+      if (!paperExecution && keypairRef.current) warmPumpSwapBuy(candidate.mint, keypairRef.current.publicKey);
     } catch (caught) {
       const reason = caught instanceof Error ? caught.message : "verification failed";
       const candidateLabel = unverifiedCandidate.symbol !== "MIG" ? unverifiedCandidate.symbol : shortAddress(unverifiedCandidate.mint);
@@ -889,7 +891,13 @@ export default function LockstepApp() {
         // be allowed to trigger directly; waiting for an HTTP confirmation can
         // let a fast token cross the whole entry band before the response lands.
         if (crossedRugTrigger) {
-          triggerCandidate = { ...candidate, ...streamedMark, marketCapUsd: streamedMarketCapUsd };
+          triggerCandidate = {
+            ...candidate,
+            ...streamedMark,
+            symbol: streamedMark.symbol === "MIG" ? candidate.symbol : streamedMark.symbol,
+            name: streamedMark.name === "Migrated token" ? candidate.name : streamedMark.name,
+            marketCapUsd: streamedMarketCapUsd,
+          };
           console.log(`[BOOST watch] ${candidate.mint} (${candidate.symbol}) live-trade trigger: mc=${streamedMarketCapUsd} t=${new Date().toISOString()}`);
           break;
         }
@@ -1078,6 +1086,7 @@ export default function LockstepApp() {
           amount: executableBuyAmount,
           slippagePercent: migrationExecutionSettings.slippage,
           pool: "pump-amm",
+          knownBalanceSol: freshBalance,
           freshTransactionRetries: 2,
           shouldRetryFreshTransaction: async () => {
             if (Date.now() >= watchDeadline || engineModeRef.current !== "active" || strategyModeRef.current !== migrationMode || positionsRef.current.some((position) => position.mint === candidate.mint)) return false;

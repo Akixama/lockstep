@@ -3,6 +3,7 @@ import { NextRequest, NextResponse } from "next/server";
 const ALLOWED_METHODS = new Set([
   "getBalance",
   "getLatestBlockhash",
+  "getMultipleAccounts",
   "getSignatureStatuses",
   "getTransaction",
   "sendTransaction",

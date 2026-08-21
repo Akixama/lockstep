@@ -107,7 +107,7 @@ test("Fresh per-token trades trigger immediately and USD market cap falls back t
 
   assert.match(source, /function marketCapUsdFor/);
   assert.match(source, /marketCapSol \* solUsdPrice/);
-  assert.match(source, /triggerCandidate = \{ \.\.\.candidate, \.\.\.streamedMark, marketCapUsd: streamedMarketCapUsd \}/);
+  assert.match(source, /triggerCandidate = \{\s*\.\.\.candidate,\s*\.\.\.streamedMark,/);
   assert.match(source, /observationSource: "poll"/);
   assert.match(source, /confirmedPostMigrationPoll = mark\.complete/);
   assert.match(source, /Boolean\(mark\.poolAddress\)/);
@@ -122,6 +122,11 @@ test("Fresh per-token trades trigger immediately and USD market cap falls back t
   assert.match(source, /Promise\.race\(\[pollResult, tradeInterrupt\.promise\]\)/);
   assert.match(source, /pollController\.abort\(\)/);
   assert.match(tradingSource, /fetchPumpPrice\(mint: string, signal\?: AbortSignal\)/);
+  assert.match(source, /warmPumpSwapBuy\(candidate\.mint, keypairRef\.current\.publicKey\)/);
+  assert.match(source, /streamedMark\.symbol === "MIG" \? candidate\.symbol/);
+  assert.match(tradingSource, /buildLocalPumpSwapBuyTransaction/);
+  assert.match(tradingSource, /PUMP_AMM_SDK\.buyQuoteInput/);
+  assert.match(tradingSource, /knownBalanceSol/);
   assert.match(source, /Date\.now\(\) - Number\(triggerCandidate\.observedAt\) <= LIVE_QUOTE_MAX_AGE_MS/);
   assert.doesNotMatch(source, /stream-confirm:/);
   assert.doesNotMatch(source, /After execution latency/);
