@@ -17,6 +17,21 @@ const RPC_URLS = [
   "https://api.mainnet-beta.solana.com",
 ].filter((url, index, urls): url is string => Boolean(url) && urls.indexOf(url) === index);
 
+type RpcPayload = { result?: unknown; error?: unknown };
+
+class RpcPayloadError extends Error {
+  payload: RpcPayload;
+
+  constructor(payload: RpcPayload) {
+    super("RPC returned an error");
+    this.payload = payload;
+  }
+}
+
+function rpcRouteLabel(url: string) {
+  try { return new URL(url).hostname; } catch { return "solana-rpc"; }
+}
+
 async function callRpc(url: string, method: string, params: unknown[]) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 4_500);
@@ -27,7 +42,7 @@ async function callRpc(url: string, method: string, params: unknown[]) {
       body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
       signal: controller.signal,
     });
-    const payload = await response.json() as { error?: unknown };
+    const payload = await response.json() as RpcPayload;
     if (!response.ok) throw new Error("RPC provider rejected the request");
     return payload;
   } finally {
@@ -41,7 +56,31 @@ export async function POST(request: NextRequest) {
     if (!body.method || !ALLOWED_METHODS.has(body.method)) {
       return NextResponse.json({ error: "RPC method is not allowed" }, { status: 400 });
     }
-    let rpcError: { error?: unknown } | null = null;
+    // Broadcasting the exact same signed bytes cannot create duplicate buys:
+    // every provider derives the same Solana signature and the network accepts
+    // that signature only once. Starting all submissions together removes a
+    // slow-provider waterfall from the latency-critical landing path.
+    if (body.method === "sendTransaction") {
+      const submissions = RPC_URLS.map(async (rpcUrl) => {
+        const payload = await callRpc(rpcUrl, body.method!, body.params ?? []);
+        if (payload.error) throw new RpcPayloadError(payload);
+        return { payload, route: rpcRouteLabel(rpcUrl) };
+      });
+      try {
+        const accepted = await Promise.any(submissions);
+        return NextResponse.json({
+          ...accepted.payload,
+          lockstep: { routesAttempted: RPC_URLS.length, acceptedBy: accepted.route },
+        });
+      } catch (caught) {
+        const errors = caught instanceof AggregateError ? caught.errors : [caught];
+        const rpcFailure = errors.find((error) => error instanceof RpcPayloadError) as RpcPayloadError | undefined;
+        if (rpcFailure) return NextResponse.json({ ...rpcFailure.payload, lockstep: { routesAttempted: RPC_URLS.length } }, { status: 422 });
+        return NextResponse.json({ error: "All Solana transaction routes are temporarily unavailable", lockstep: { routesAttempted: RPC_URLS.length } }, { status: 502 });
+      }
+    }
+
+    let rpcError: RpcPayload | null = null;
     for (const rpcUrl of RPC_URLS) {
       try {
         const payload = await callRpc(rpcUrl, body.method, body.params ?? []);

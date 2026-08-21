@@ -1,7 +1,7 @@
 "use client";
 
 import { AccountLayout } from "@solana/spl-token";
-import { PUMP_AMM_SDK, OnlinePumpAmmSdk, canonicalPumpPoolPda, type SwapSolanaState } from "@pump-fun/pump-swap-sdk";
+import type { OnlinePumpAmmSdk, SwapSolanaState } from "@pump-fun/pump-swap-sdk";
 import { ComputeBudgetProgram, Connection, Keypair, PublicKey, TransactionMessage, VersionedTransaction } from "@solana/web3.js";
 import BN from "bn.js";
 
@@ -75,6 +75,20 @@ export type LiveBuyQuote = {
 
 export type PaperBuyBuild = { transactionBytes: number };
 
+export type LiveExecutionDiagnostics = {
+  attempt: number;
+  builder: "local-pumpswap" | "remote" | "remote-fallback" | "unknown";
+  buildMs: number;
+  signMs: number;
+  fundingCheckMs: number;
+  submitMs: number;
+  confirmMs: number;
+  totalMs: number;
+  signalToSubmitMs?: number;
+  routesAttempted: number;
+  acceptedBy?: string;
+};
+
 export type TokenTradeStreamStatus = "connecting" | "live" | "error";
 export type TokenTradeWatcher = (
   mint: string,
@@ -105,6 +119,7 @@ let priorityFeeExpiresAt = 0;
 let priorityFeeRefresh: Promise<number> | null = null;
 let pumpSwapConnection: Connection | null = null;
 let pumpSwapOnlineSdk: OnlinePumpAmmSdk | null = null;
+let pumpSwapModulePromise: Promise<typeof import("@pump-fun/pump-swap-sdk")> | null = null;
 const preparedPumpSwapStates = new Map<string, Promise<{ state: SwapSolanaState; preparedAt: number }>>();
 
 async function fetchCompetitivePriorityFeeSol(): Promise<number> {
@@ -150,13 +165,15 @@ export function warmLiveTradePreparation() {
   void refreshCompetitivePriorityFeeSol();
 }
 
-function getPumpSwapClients() {
+async function getPumpSwapClients() {
+  pumpSwapModulePromise ??= import("@pump-fun/pump-swap-sdk");
+  const pumpSwapModule = await pumpSwapModulePromise;
   if (!pumpSwapConnection || !pumpSwapOnlineSdk) {
     const endpoint = new URL("/api/rpc", window.location.origin).toString();
     pumpSwapConnection = new Connection(endpoint, { commitment: "processed", disableRetryOnRateLimit: true });
-    pumpSwapOnlineSdk = new OnlinePumpAmmSdk(pumpSwapConnection);
+    pumpSwapOnlineSdk = new pumpSwapModule.OnlinePumpAmmSdk(pumpSwapConnection);
   }
-  return { connection: pumpSwapConnection, onlineSdk: pumpSwapOnlineSdk };
+  return { connection: pumpSwapConnection, onlineSdk: pumpSwapOnlineSdk, pumpSwapModule };
 }
 
 function pumpSwapPreparationKey(mint: string, user: PublicKey) {
@@ -171,8 +188,8 @@ function preparePumpSwapState(mint: string, user: PublicKey) {
     const oldest = preparedPumpSwapStates.keys().next().value;
     if (oldest) preparedPumpSwapStates.delete(oldest);
   }
-  const { onlineSdk } = getPumpSwapClients();
-  const preparation = onlineSdk.swapSolanaState(canonicalPumpPoolPda(new PublicKey(mint)), user)
+  const preparation = getPumpSwapClients()
+    .then(({ onlineSdk, pumpSwapModule }) => onlineSdk.swapSolanaState(pumpSwapModule.canonicalPumpPoolPda(new PublicKey(mint)), user))
     .then((state) => ({ state, preparedAt: Date.now() }))
     .catch((error) => {
       preparedPumpSwapStates.delete(key);
@@ -202,7 +219,7 @@ async function buildLocalPumpSwapBuyTransaction({ keypair, mint, amountSol, slip
     preparedPumpSwapStates.delete(key);
     prepared = await preparePumpSwapState(mint, keypair.publicKey);
   }
-  const { connection } = getPumpSwapClients();
+  const { connection, pumpSwapModule } = await getPumpSwapClients();
   const { state } = prepared;
   const accountKeys = [
     state.poolKey,
@@ -219,7 +236,7 @@ async function buildLocalPumpSwapBuyTransaction({ keypair, mint, amountSol, slip
   if (!poolAccountInfo || !poolBaseAccountInfo || !poolQuoteAccountInfo) throw new Error("Fresh PumpSwap pool accounts were unavailable");
   const blockhash = blockhashResult.value?.blockhash;
   if (!blockhash) throw new Error("A fresh Solana blockhash was unavailable");
-  const pool = PUMP_AMM_SDK.decodePool(poolAccountInfo);
+  const pool = pumpSwapModule.PUMP_AMM_SDK.decodePool(poolAccountInfo);
   const poolBaseAmount = new BN(AccountLayout.decode(poolBaseAccountInfo.data).amount.toString());
   const poolQuoteAmount = new BN(AccountLayout.decode(poolQuoteAccountInfo.data).amount.toString());
   const freshState: SwapSolanaState = {
@@ -233,7 +250,7 @@ async function buildLocalPumpSwapBuyTransaction({ keypair, mint, amountSol, slip
   };
   const quoteLamports = Math.round(amountSol * LAMPORTS_PER_SOL);
   if (!Number.isSafeInteger(quoteLamports) || quoteLamports <= 0) throw new Error("The local PumpSwap order amount was invalid");
-  const buyInstructions = await PUMP_AMM_SDK.buyQuoteInput(freshState, new BN(quoteLamports), slippagePercent);
+  const buyInstructions = await pumpSwapModule.PUMP_AMM_SDK.buyQuoteInput(freshState, new BN(quoteLamports), slippagePercent);
   const microLamportsPerUnit = Math.max(1, Math.ceil(priorityFeeSol * LAMPORTS_PER_SOL * 1_000_000 / ESTIMATED_COMPUTE_UNITS));
   const message = new TransactionMessage({
     payerKey: keypair.publicKey,
@@ -266,15 +283,38 @@ function base64ToBytes(value: string) {
   return Uint8Array.from(atob(value), (char) => char.charCodeAt(0));
 }
 
-async function rpc(method: string, params: unknown[]) {
+type RpcEnvelope = {
+  result?: unknown;
+  error?: { message?: string } | string;
+  lockstep?: { routesAttempted?: number; acceptedBy?: string };
+};
+
+class RpcRequestError extends Error {
+  lockstep?: RpcEnvelope["lockstep"];
+
+  constructor(message: string, lockstep?: RpcEnvelope["lockstep"]) {
+    super(message);
+    this.name = "RpcRequestError";
+    this.lockstep = lockstep;
+  }
+}
+
+async function rpcEnvelope(method: string, params: unknown[]): Promise<RpcEnvelope> {
   const response = await fetch("/api/rpc", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ method, params }),
   });
   const payload = await response.json();
-  if (!response.ok || payload.error) throw new Error(payload.error?.message ?? payload.error ?? `${method} failed`);
-  return payload.result;
+  if (!response.ok || payload.error) {
+    const message = typeof payload.error === "object" ? payload.error?.message : payload.error;
+    throw new RpcRequestError(message ?? `${method} failed`, payload.lockstep);
+  }
+  return payload;
+}
+
+async function rpc(method: string, params: unknown[]) {
+  return (await rpcEnvelope(method, params)).result;
 }
 
 // PumpPortal's trade-local builder can lag a few seconds behind fresh on-chain
@@ -312,6 +352,7 @@ export class LiveTradeError extends Error {
   logs?: string[];
   confirmedOnChainFailure: boolean;
   attempts = 1;
+  executionDiagnostics?: LiveExecutionDiagnostics;
 
   constructor(message: string, options: { signature?: string; rawError?: unknown; confirmedOnChainFailure?: boolean } = {}) {
     super(message);
@@ -325,6 +366,7 @@ export class LiveTradeError extends Error {
 export class LiveTradeFundingError extends Error {
   balanceSol: number;
   requiredSol: number;
+  executionDiagnostics?: LiveExecutionDiagnostics;
 
   constructor(balanceSol: number, requiredSol: number, message = "The wallet cannot fund the complete transaction") {
     super(message);
@@ -351,16 +393,18 @@ export function isRetryableLiveTradeFailure(error: unknown): boolean {
 }
 
 export function describeLiveTradeFailure(error: unknown): string {
+  const executionDetail = formatLiveExecutionDiagnostics(error);
+  const executionDiagnostic = executionDetail ? ` · ${executionDetail}` : "";
   if (error instanceof LiveTradeFundingError) {
-    return `not enough SOL for the complete transaction · balance ${error.balanceSol.toFixed(4)} SOL · deposit to at least ${error.requiredSol.toFixed(4)} SOL`;
+    return `not enough SOL for the complete transaction · balance ${error.balanceSol.toFixed(4)} SOL · deposit to at least ${error.requiredSol.toFixed(4)} SOL${executionDiagnostic}`;
   }
   const rawMessage = tradeErrorText(error);
   const lastProgramLog = error instanceof LiveTradeError && error.logs?.length
     ? error.logs[error.logs.length - 1]?.replace(/^Program log:\s*/i, "").slice(0, 120)
     : "";
   const diagnostic = error instanceof LiveTradeError
-    ? `${error.signature ? ` · tx ${error.signature.slice(0, 12)}…` : ""}${error.attempts > 1 ? ` · ${error.attempts} fresh attempts` : ""}${lastProgramLog ? ` · log: ${lastProgramLog}` : ""}`
-    : "";
+    ? `${error.signature ? ` · tx ${error.signature.slice(0, 12)}…` : ""}${error.attempts > 1 ? ` · ${error.attempts} fresh attempts` : ""}${lastProgramLog ? ` · log: ${lastProgramLog}` : ""}${executionDiagnostic}`
+    : executionDiagnostic;
   if (/Program 11111111111111111111111111111111 failed: custom program error: 0x1\b/i.test(rawMessage)) {
     return `the Solana System Program rejected a debit that would make an account balance negative; the wallet did not have enough spendable SOL for the complete transaction${diagnostic}`;
   }
@@ -374,18 +418,18 @@ export function describeLiveTradeFailure(error: unknown): string {
     return `the pool routing was stale, this coin had already migrated off the bonding curve${diagnostic}`;
   }
   if (/confirmation timed out/i.test(rawMessage)) {
-    return "the transaction never confirmed in time, likely network congestion or it was dropped";
+    return `the transaction never confirmed in time, likely network congestion or it was dropped${diagnostic}`;
   }
   if (/could not build transaction/i.test(rawMessage)) {
-    return "the trade builder could not prepare an order for this coin";
+    return `the trade builder could not prepare an order for this coin${diagnostic}`;
   }
   if (/insufficient/i.test(rawMessage)) {
-    return "not enough SOL in the wallet for this order";
+    return `not enough SOL in the wallet for this order${diagnostic}`;
   }
   if (/blockhash/i.test(rawMessage)) {
-    return "the transaction expired before it could land, the network was too slow";
+    return `the transaction expired before it could land, the network was too slow${diagnostic}`;
   }
-  return rawMessage;
+  return `${rawMessage}${diagnostic}`;
 }
 
 async function buildRemoteTradeTransaction({ keypair, action, mint, amount, slippagePercent, pool, priorityFeeSol }: { keypair: Keypair; action: "buy" | "sell"; mint: string; amount: number | string; slippagePercent: number; pool: "auto" | "pump" | "pump-amm"; priorityFeeSol: number }) {
@@ -408,58 +452,154 @@ async function buildRemoteTradeTransaction({ keypair, action, mint, amount, slip
   return VersionedTransaction.deserialize(base64ToBytes(payload.transaction));
 }
 
-async function attemptTrade({ keypair, action, mint, amount, slippagePercent, pool, priorityFeeSol, knownBalanceSol }: { keypair: Keypair; action: "buy" | "sell"; mint: string; amount: number | string; slippagePercent: number; pool: "auto" | "pump" | "pump-amm"; priorityFeeSol: number; knownBalanceSol?: number }) {
-  const balancePromise = action === "buy"
-    ? Number.isFinite(knownBalanceSol)
-      ? Promise.resolve(Number(knownBalanceSol))
-      : rpc("getBalance", [keypair.publicKey.toBase58(), { commitment: "confirmed" }]).then((result) => Number((result as { value?: number }).value ?? 0) / LAMPORTS_PER_SOL)
-    : null;
-  let transaction: VersionedTransaction;
-  if (action === "buy" && pool === "pump-amm" && typeof amount === "number") {
-    try {
-      transaction = await buildLocalPumpSwapBuyTransaction({ keypair, mint, amountSol: amount, slippagePercent, priorityFeeSol });
-    } catch {
-      // Preserve availability if a newly migrated pool is not indexed by the
-      // read RPC yet. The existing PumpPortal builder remains a safe fallback.
+type ErrorWithExecutionDiagnostics = Error & { executionDiagnostics?: LiveExecutionDiagnostics };
+
+function attachExecutionDiagnostics(error: unknown, diagnostics: LiveExecutionDiagnostics): ErrorWithExecutionDiagnostics {
+  const normalized = error instanceof Error ? error as ErrorWithExecutionDiagnostics : new LiveTradeError(stringifyTradeError(error), { rawError: error });
+  normalized.executionDiagnostics = { ...diagnostics };
+  return normalized;
+}
+
+function diagnosticsFrom(value: unknown) {
+  return value instanceof Error ? (value as ErrorWithExecutionDiagnostics).executionDiagnostics : undefined;
+}
+
+function formatDuration(milliseconds: number) {
+  if (milliseconds >= 1_000) return `${(milliseconds / 1_000).toFixed(2)}s`;
+  return `${Math.max(0, Math.round(milliseconds))}ms`;
+}
+
+export function formatLiveExecutionDiagnostics(value: unknown) {
+  const detail = value && typeof value === "object" && "builder" in value
+    ? value as LiveExecutionDiagnostics
+    : diagnosticsFrom(value);
+  if (!detail) return "";
+  const route = detail.routesAttempted > 1
+    ? `${detail.routesAttempted} RPC routes${detail.acceptedBy ? `, ${detail.acceptedBy} first` : ""}`
+    : `${Math.max(1, detail.routesAttempted)} RPC route${detail.acceptedBy ? `, ${detail.acceptedBy}` : ""}`;
+  return [
+    `execution ${detail.builder}`,
+    `attempt ${detail.attempt}`,
+    detail.signalToSubmitMs === undefined ? "" : `signal→send ${formatDuration(detail.signalToSubmitMs)}`,
+    `build ${formatDuration(detail.buildMs)}`,
+    `sign ${formatDuration(detail.signMs)}`,
+    `funding ${formatDuration(detail.fundingCheckMs)}`,
+    `submit ${formatDuration(detail.submitMs)} via ${route}`,
+    `confirm ${formatDuration(detail.confirmMs)}`,
+    `total ${formatDuration(detail.totalMs)}`,
+  ].filter(Boolean).join(" · ");
+}
+
+async function attemptTrade({ keypair, action, mint, amount, slippagePercent, pool, priorityFeeSol, knownBalanceSol, attempt, signalObservedAt }: { keypair: Keypair; action: "buy" | "sell"; mint: string; amount: number | string; slippagePercent: number; pool: "auto" | "pump" | "pump-amm"; priorityFeeSol: number; knownBalanceSol?: number; attempt: number; signalObservedAt?: number }) {
+  const attemptStartedAt = performance.now();
+  const diagnostics: LiveExecutionDiagnostics = {
+    attempt,
+    builder: "unknown",
+    buildMs: 0,
+    signMs: 0,
+    fundingCheckMs: 0,
+    submitMs: 0,
+    confirmMs: 0,
+    totalMs: 0,
+    routesAttempted: 1,
+  };
+  let activePhase: "build" | "sign" | "funding" | "submit" | "confirm" | null = null;
+  let activePhaseStartedAt = attemptStartedAt;
+  const beginPhase = (phase: typeof activePhase) => {
+    activePhase = phase;
+    activePhaseStartedAt = performance.now();
+  };
+  const finishPhase = () => {
+    const elapsed = performance.now() - activePhaseStartedAt;
+    if (activePhase === "build") diagnostics.buildMs = elapsed;
+    if (activePhase === "sign") diagnostics.signMs = elapsed;
+    if (activePhase === "funding") diagnostics.fundingCheckMs = elapsed;
+    if (activePhase === "submit") diagnostics.submitMs = elapsed;
+    if (activePhase === "confirm") diagnostics.confirmMs = elapsed;
+    activePhase = null;
+  };
+  try {
+    const balancePromise = action === "buy"
+      ? Number.isFinite(knownBalanceSol)
+        ? Promise.resolve(Number(knownBalanceSol))
+        : rpc("getBalance", [keypair.publicKey.toBase58(), { commitment: "confirmed" }]).then((result) => Number((result as { value?: number }).value ?? 0) / LAMPORTS_PER_SOL)
+      : null;
+    beginPhase("build");
+    let transaction: VersionedTransaction;
+    if (action === "buy" && pool === "pump-amm" && typeof amount === "number") {
+      try {
+        diagnostics.builder = "local-pumpswap";
+        transaction = await buildLocalPumpSwapBuyTransaction({ keypair, mint, amountSol: amount, slippagePercent, priorityFeeSol });
+      } catch {
+        // Preserve availability if a newly migrated pool is not indexed by the
+        // read RPC yet. The existing PumpPortal builder remains a safe fallback.
+        diagnostics.builder = "remote-fallback";
+        transaction = await buildRemoteTradeTransaction({ keypair, action, mint, amount, slippagePercent, pool, priorityFeeSol });
+      }
+    } else {
+      diagnostics.builder = "remote";
       transaction = await buildRemoteTradeTransaction({ keypair, action, mint, amount, slippagePercent, pool, priorityFeeSol });
     }
-  } else {
-    transaction = await buildRemoteTradeTransaction({ keypair, action, mint, amount, slippagePercent, pool, priorityFeeSol });
-  }
-  if (pool === "pump-amm" && transaction.message.staticAccountKeys
-    .some((key) => key.toBase58() === PUMP_BONDING_CURVE_PROGRAM)) {
-    throw new Error("The trade builder returned a stale bonding-curve transaction after migration");
-  }
-  transaction.sign([keypair]);
-  if (action === "buy") {
-    const balanceSol = await balancePromise!;
-    // Covers the exact order, the priority fee selected for this transaction,
-    // base signature fee, token-account rent and a small landing reserve.
-    const requiredSol = Number(amount) + priorityFeeSol + 0.0021 + 0.000005 + 0.001;
-    if (!Number.isFinite(balanceSol) || balanceSol < requiredSol) {
-      throw new LiveTradeFundingError(balanceSol, requiredSol);
+    finishPhase();
+    if (pool === "pump-amm" && transaction.message.staticAccountKeys
+      .some((key) => key.toBase58() === PUMP_BONDING_CURVE_PROGRAM)) {
+      throw new Error("The trade builder returned a stale bonding-curve transaction after migration");
     }
-    // A low-margin PumpSwap wallet gets one read-only simulation. It catches
-    // transaction-specific account creation/rent that a generic reserve cannot
-    // know before PumpPortal builds the transaction, without charging a fee.
-    if (pool === "pump-amm" && balanceSol < Number(amount) + 0.015) {
-      const simulation = await rpc("simulateTransaction", [bytesToBase64(transaction.serialize()), {
-        encoding: "base64",
-        commitment: "processed",
-        sigVerify: true,
-        accounts: { encoding: "base64", addresses: [keypair.publicKey.toBase58()] },
-      }]) as { value?: { err?: unknown; logs?: string[] | null } };
-      const simulationText = [stringifyTradeError(simulation.value?.err), ...(simulation.value?.logs ?? [])].join(" · ");
-      if (/Program 11111111111111111111111111111111 failed: custom program error: 0x1\b/i.test(simulationText)) {
-        throw new LiveTradeFundingError(balanceSol, Number(amount) + 0.015, "The built transaction requires more spendable lamports than this wallet has");
+    beginPhase("sign");
+    transaction.sign([keypair]);
+    finishPhase();
+    beginPhase("funding");
+    if (action === "buy") {
+      const balanceSol = await balancePromise!;
+      // Covers the exact order, the priority fee selected for this transaction,
+      // base signature fee, token-account rent and a small landing reserve.
+      const requiredSol = Number(amount) + priorityFeeSol + 0.0021 + 0.000005 + 0.001;
+      if (!Number.isFinite(balanceSol) || balanceSol < requiredSol) {
+        throw new LiveTradeFundingError(balanceSol, requiredSol);
+      }
+      // A low-margin PumpSwap wallet gets one read-only simulation. It catches
+      // transaction-specific account creation/rent that a generic reserve cannot
+      // know before PumpPortal builds the transaction, without charging a fee.
+      if (pool === "pump-amm" && balanceSol < Number(amount) + 0.015) {
+        const simulation = await rpc("simulateTransaction", [bytesToBase64(transaction.serialize()), {
+          encoding: "base64",
+          commitment: "processed",
+          sigVerify: true,
+          accounts: { encoding: "base64", addresses: [keypair.publicKey.toBase58()] },
+        }]) as { value?: { err?: unknown; logs?: string[] | null } };
+        const simulationText = [stringifyTradeError(simulation.value?.err), ...(simulation.value?.logs ?? [])].join(" · ");
+        if (/Program 11111111111111111111111111111111 failed: custom program error: 0x1\b/i.test(simulationText)) {
+          throw new LiveTradeFundingError(balanceSol, Number(amount) + 0.015, "The built transaction requires more spendable lamports than this wallet has");
+        }
       }
     }
+    finishPhase();
+    const serializedTransaction = bytesToBase64(transaction.serialize());
+    beginPhase("submit");
+    if (Number.isFinite(signalObservedAt)) diagnostics.signalToSubmitMs = Math.max(0, Date.now() - Number(signalObservedAt));
+    // The server broadcasts these exact signed bytes to every configured RPC.
+    // Identical bytes have one signature, so multiple routes improve landing
+    // without creating multiple orders.
+    const submission = await rpcEnvelope("sendTransaction", [serializedTransaction, { encoding: "base64", skipPreflight: true, maxRetries: 3 }]);
+    finishPhase();
+    diagnostics.routesAttempted = Math.max(1, Number(submission.lockstep?.routesAttempted ?? 1));
+    diagnostics.acceptedBy = submission.lockstep?.acceptedBy;
+    const signature = submission.result;
+    if (typeof signature !== "string" || !signature) throw new Error("Solana RPC did not return a transaction signature");
+    beginPhase("confirm");
+    await waitForConfirmation(signature);
+    finishPhase();
+    diagnostics.totalMs = performance.now() - attemptStartedAt;
+    return { signature, diagnostics };
+  } catch (caught) {
+    if (activePhase) finishPhase();
+    if (caught instanceof RpcRequestError) {
+      diagnostics.routesAttempted = Math.max(1, Number(caught.lockstep?.routesAttempted ?? diagnostics.routesAttempted));
+      diagnostics.acceptedBy = caught.lockstep?.acceptedBy;
+    }
+    diagnostics.totalMs = performance.now() - attemptStartedAt;
+    throw attachExecutionDiagnostics(caught, diagnostics);
   }
-  // Fresh Pump.fun accounts can reach the leader before shared RPC simulation nodes.
-  // Submit the signed transaction directly, then verify confirmation below.
-  const signature = await rpc("sendTransaction", [bytesToBase64(transaction.serialize()), { encoding: "base64", skipPreflight: true, maxRetries: 3 }]) as string;
-  await waitForConfirmation(signature);
-  return signature;
 }
 
 async function enrichLiveTradeError(error: LiveTradeError) {
@@ -473,7 +613,7 @@ async function enrichLiveTradeError(error: LiveTradeError) {
   return error;
 }
 
-export async function buildSignAndSendTrade({ keypair, action, mint, amount, slippagePercent, pool, knownBalanceSol, freshTransactionRetries = 0, shouldRetryFreshTransaction, onFreshTransactionRetry }: {
+export async function buildSignAndSendTrade({ keypair, action, mint, amount, slippagePercent, pool, knownBalanceSol, signalObservedAt, freshTransactionRetries = 0, shouldRetryFreshTransaction, onFreshTransactionRetry, onExecutionDiagnostics }: {
   keypair: Keypair;
   action: "buy" | "sell";
   mint: string;
@@ -481,9 +621,11 @@ export async function buildSignAndSendTrade({ keypair, action, mint, amount, sli
   slippagePercent: number;
   pool?: "auto" | "pump" | "pump-amm";
   knownBalanceSol?: number;
+  signalObservedAt?: number;
   freshTransactionRetries?: number;
   shouldRetryFreshTransaction?: () => Promise<boolean>;
-  onFreshTransactionRetry?: (attempt: number) => void;
+  onFreshTransactionRetry?: (attempt: number, diagnostics?: LiveExecutionDiagnostics) => void;
+  onExecutionDiagnostics?: (diagnostics: LiveExecutionDiagnostics) => void;
 }) {
   const requestedPool = pool ?? "auto";
   let activePool = requestedPool;
@@ -495,7 +637,9 @@ export async function buildSignAndSendTrade({ keypair, action, mint, amount, sli
     try {
       // The cache is refreshed in the background; fee lookup is no longer on
       // the latency-critical path between detecting the rug and submitting.
-      return await attemptTrade({ keypair, action, mint, amount, slippagePercent, pool: activePool, priorityFeeSol: getCachedCompetitivePriorityFeeSol(), knownBalanceSol });
+      const result = await attemptTrade({ keypair, action, mint, amount, slippagePercent, pool: activePool, priorityFeeSol: getCachedCompetitivePriorityFeeSol(), knownBalanceSol, attempt: attempts, signalObservedAt });
+      onExecutionDiagnostics?.(result.diagnostics);
+      return result.signature;
     } catch (caught) {
       // Pump and PumpSwap reuse numeric Anchor error codes. Fetch the program
       // logs before classification so PumpSwap 6004 becomes a slippage retry,
@@ -524,7 +668,7 @@ export async function buildSignAndSendTrade({ keypair, action, mint, amount, sli
         && retryWindowStillValid;
       if (canRetry) {
         freshRetriesUsed += 1;
-        onFreshTransactionRetry?.(freshRetriesUsed + 1);
+        onFreshTransactionRetry?.(freshRetriesUsed + 1, diagnosticsFrom(classifiedError));
         continue;
       }
       if (classifiedError instanceof LiveTradeError) {

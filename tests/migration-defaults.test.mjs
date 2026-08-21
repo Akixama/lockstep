@@ -7,6 +7,7 @@ const tradingSourceUrl = new URL("../app/trading.ts", import.meta.url);
 const relayRouteSourceUrl = new URL("../app/api/pumpportal-trades/route.ts", import.meta.url);
 const relaySourceUrl = new URL("../app/api/pumpportal-trades/relay.ts", import.meta.url);
 const persistentRelaySourceUrl = new URL("../relay/server.mjs", import.meta.url);
+const rpcRouteSourceUrl = new URL("../app/api/rpc/route.ts", import.meta.url);
 
 test("Migration Paper starts from its confirmed defaults instead of legacy settings", async () => {
   const source = await readFile(sourceUrl, "utf8");
@@ -156,6 +157,24 @@ test("Live entries rebuild only transactions confirmed failed on-chain", async (
   assert.match(source, /freshTransactionRetries: 2/g);
   assert.match(source, /fresh retries exhausted, still scanning/g);
   assert.match(source, /isRetryableLiveTradeFailure\(error\)/);
+});
+
+test("Live execution broadcasts one signed transaction across RPC routes and records phase timings", async () => {
+  const source = await readFile(sourceUrl, "utf8");
+  const tradingSource = await readFile(tradingSourceUrl, "utf8");
+  const rpcRouteSource = await readFile(rpcRouteSourceUrl, "utf8");
+
+  assert.match(rpcRouteSource, /body\.method === "sendTransaction"/);
+  assert.match(rpcRouteSource, /Promise\.any\(submissions\)/);
+  assert.match(rpcRouteSource, /routesAttempted: RPC_URLS\.length/);
+  assert.match(rpcRouteSource, /same Solana signature/);
+  assert.match(tradingSource, /type LiveExecutionDiagnostics/);
+  assert.match(tradingSource, /signal→send/);
+  assert.match(tradingSource, /build \$\{formatDuration\(detail\.buildMs\)\}/);
+  assert.match(tradingSource, /submit \$\{formatDuration\(detail\.submitMs\)\} via \$\{route\}/);
+  assert.match(tradingSource, /onExecutionDiagnostics/);
+  assert.match(source, /formatLiveExecutionDiagnostics\(diagnostics\)/g);
+  assert.match(source, /signalObservedAt: Number\(triggerCandidate\.observedAt/);
 });
 
 test("System Program insufficient-funds failures are explained and never retried", async () => {

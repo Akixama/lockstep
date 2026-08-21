@@ -9,7 +9,7 @@ import { gcm } from "@noble/ciphers/aes";
 import { pbkdf2Async } from "@noble/hashes/pbkdf2";
 import { sha256 } from "@noble/hashes/sha256";
 import { utf8ToBytes } from "@noble/hashes/utils";
-import { buildExactPaperBuy, buildSignAndSendTrade, describeLiveTradeFailure, fetchLiveBuyQuote, fetchPumpPrice, isRetryableLiveTradeFailure, openLaunchFeed, openMigrationFeed, verifyMigrationCandidate, warmLiveTradePreparation, warmPumpSwapBuy, type LaunchCandidate, type LivePosition, type TokenTradeWatcher } from "./trading";
+import { buildExactPaperBuy, buildSignAndSendTrade, describeLiveTradeFailure, fetchLiveBuyQuote, fetchPumpPrice, formatLiveExecutionDiagnostics, isRetryableLiveTradeFailure, openLaunchFeed, openMigrationFeed, verifyMigrationCandidate, warmLiveTradePreparation, warmPumpSwapBuy, type LaunchCandidate, type LivePosition, type TokenTradeWatcher } from "./trading";
 
 type StoredWallet = {
   version: 1;
@@ -536,21 +536,21 @@ export default function LockstepApp() {
     mintExitInFlight.current.add(position.mint);
     setPositions((current) => current.map((item) => item.id === position.id ? { ...item, status: "closing" } : item));
     addExecutionActivity(`Selling ${position.symbol}`, `${reason} · submitting 100% exit`, "neutral", position.mint);
+    let executionDetail = "";
     try {
       const balanceBefore = await getBalance(keypairRef.current.publicKey.toBase58());
       const sellSlippage = position.source === "migration" ? migrationLiveSettings.exitImpact : newPairsSettings.slippage;
-      const signature = await buildSignAndSendTrade({ keypair: keypairRef.current, action: "sell", mint: position.mint, amount: "100%", slippagePercent: sellSlippage, pool: position.source === "migration" ? "pump-amm" : "auto" });
+      const signature = await buildSignAndSendTrade({ keypair: keypairRef.current, action: "sell", mint: position.mint, amount: "100%", slippagePercent: sellSlippage, pool: position.source === "migration" ? "pump-amm" : "auto", onExecutionDiagnostics: (diagnostics) => { executionDetail = formatLiveExecutionDiagnostics(diagnostics); } });
       const balanceAfter = await getChangedBalance(keypairRef.current.publicKey.toBase58(), balanceBefore, "higher");
       const netProceeds = Math.max(0, balanceAfter - balanceBefore);
       const pnl = netProceeds - (position.actualCostSol ?? position.amountSol);
       setRealizedPnl((value) => value + pnl);
       setPositions((current) => current.filter((item) => item.id !== position.id));
-      addExecutionActivity(`Sold ${position.symbol}`, `${reason} · ${pnl >= 0 ? "+" : ""}${pnl.toFixed(4)} SOL · ${signature.slice(0, 8)}…`, pnl >= 0 ? "good" : "warn", position.mint);
+      addExecutionActivity(`Sold ${position.symbol}`, `${reason} · ${pnl >= 0 ? "+" : ""}${pnl.toFixed(4)} SOL · ${signature.slice(0, 8)}…${executionDetail ? ` · ${executionDetail}` : ""}`, pnl >= 0 ? "good" : "warn", position.mint);
       void refreshBalance();
     } catch (caught) {
       setPositions((current) => current.map((item) => item.id === position.id ? { ...item, status: "open" } : item));
-      const rawDetail = caught instanceof Error ? caught.message : "Transaction failed";
-      addExecutionActivity(`Exit failed: ${position.symbol}`, describeLiveTradeFailure(rawDetail), "warn", position.mint);
+      addExecutionActivity(`Exit failed: ${position.symbol}`, describeLiveTradeFailure(caught), "warn", position.mint);
     } finally {
       exitInFlight.current.delete(position.id);
       mintExitInFlight.current.delete(position.mint);
@@ -565,9 +565,10 @@ export default function LockstepApp() {
     mintExitInFlight.current.add(position.mint);
     const slicePercent = Math.min(100, Math.max(1, position.migrationExitPlan.slicePercent));
     addExecutionActivity(`Selling ${slicePercent}% remaining: ${position.symbol}`, `Timed migration exit · submitting live mainnet transaction`, "neutral", position.mint);
+    let executionDetail = "";
     try {
       const balanceBefore = await getBalance(keypairRef.current.publicKey.toBase58());
-      const signature = await buildSignAndSendTrade({ keypair: keypairRef.current, action: "sell", mint: position.mint, amount: `${slicePercent}%`, slippagePercent: migrationLiveSettings.exitImpact, pool: "pump-amm" });
+      const signature = await buildSignAndSendTrade({ keypair: keypairRef.current, action: "sell", mint: position.mint, amount: `${slicePercent}%`, slippagePercent: migrationLiveSettings.exitImpact, pool: "pump-amm", onExecutionDiagnostics: (diagnostics) => { executionDetail = formatLiveExecutionDiagnostics(diagnostics); } });
       const balanceAfter = await getChangedBalance(keypairRef.current.publicKey.toBase58(), balanceBefore, "higher");
       const netProceeds = Math.max(0, balanceAfter - balanceBefore);
       const remainingCost = position.actualCostSol ?? position.amountSol;
@@ -577,11 +578,10 @@ export default function LockstepApp() {
       const nextPlan = { ...position.migrationExitPlan, slicesCompleted: position.migrationExitPlan.slicesCompleted + 1, nextSliceAt: Date.now() + position.migrationExitPlan.intervalSeconds * 1000 };
       setRealizedPnl((value) => value + pnl);
       setPositions((current) => current.map((item) => item.id === position.id ? { ...item, remainingPercent, actualCostSol: Math.max(0, remainingCost - soldCost), migrationExitPlan: nextPlan } : item));
-      addExecutionActivity(`Sold ${slicePercent}% remaining: ${position.symbol}`, `${remainingPercent.toFixed(1)}% of original tokens left · ${pnl >= 0 ? "+" : ""}${pnl.toFixed(4)} SOL · ${signature.slice(0, 8)}…`, pnl >= 0 ? "good" : "warn", position.mint);
+      addExecutionActivity(`Sold ${slicePercent}% remaining: ${position.symbol}`, `${remainingPercent.toFixed(1)}% of original tokens left · ${pnl >= 0 ? "+" : ""}${pnl.toFixed(4)} SOL · ${signature.slice(0, 8)}…${executionDetail ? ` · ${executionDetail}` : ""}`, pnl >= 0 ? "good" : "warn", position.mint);
       void refreshBalance();
     } catch (caught) {
-      const rawDetail = caught instanceof Error ? caught.message : "Transaction failed";
-      addExecutionActivity(`Timed exit failed: ${position.symbol}`, `${describeLiveTradeFailure(rawDetail)} · will retry`, "warn", position.mint);
+      addExecutionActivity(`Timed exit failed: ${position.symbol}`, `${describeLiveTradeFailure(caught)} · will retry`, "warn", position.mint);
     } finally {
       exitInFlight.current.delete(position.id);
       mintExitInFlight.current.delete(position.mint);
@@ -608,8 +608,10 @@ export default function LockstepApp() {
     liveTradeInFlight.current = true;
     const baseAmount = Math.max(0.001, newPairsSettings.buyAmount);
     const adaptiveAmount = Math.max(baseAmount, newPairsSettings.adaptiveBuyAmount);
+    const signalObservedAt = Date.now();
     addExecutionActivity(`${candidate.symbol} detected`, `Fresh Pump.fun launch · checking live ${adaptiveAmount} SOL impact`, "neutral", candidate.mint);
     let transactionStarted = false;
+    let executionDetail = "";
     try {
       let quote = await fetchLiveBuyQuote(candidate, adaptiveAmount);
       if (Date.now() - quote.quotedAt > LIVE_QUOTE_MAX_AGE_MS) throw new Error("Live quote expired before entry");
@@ -636,20 +638,22 @@ export default function LockstepApp() {
         amount: quote.amountSol,
         slippagePercent: newPairsSettings.slippage,
         knownBalanceSol: freshBalance,
+        signalObservedAt,
         freshTransactionRetries: 2,
         shouldRetryFreshTransaction: async () => {
           if (engineModeRef.current !== "active" || strategyModeRef.current !== "new-pairs-live" || positionsRef.current.some((position) => position.mint === candidate.mint)) return false;
           const freshQuote = await fetchLiveBuyQuote(candidate, quote.amountSol);
           return Date.now() - freshQuote.quotedAt <= LIVE_QUOTE_MAX_AGE_MS && freshQuote.impactPercent < newPairsSettings.maxQuoteImpact;
         },
-        onFreshTransactionRetry: (attempt) => addExecutionActivity(`Retrying ${candidate.symbol}`, `Previous transaction was confirmed failed on-chain · rebuilding fresh transaction (${attempt}/3)`, "neutral", candidate.mint),
+        onFreshTransactionRetry: (attempt, diagnostics) => addExecutionActivity(`Retrying ${candidate.symbol}`, `Previous transaction was confirmed failed on-chain${diagnostics ? ` · ${formatLiveExecutionDiagnostics(diagnostics)}` : ""} · rebuilding fresh transaction (${attempt}/3)`, "neutral", candidate.mint),
+        onExecutionDiagnostics: (diagnostics) => { executionDetail = formatLiveExecutionDiagnostics(diagnostics); },
       });
       const balanceAfter = await getChangedBalance(keypairRef.current.publicKey.toBase58(), balanceBefore, "lower");
       const actualCostSol = Math.max(quote.amountSol, balanceBefore - balanceAfter);
       const position: LivePosition = { id: makeId(), mint: candidate.mint, symbol: candidate.symbol.slice(0, 12), name: candidate.name.slice(0, 32), entryPriceSol: candidate.priceSol, currentPriceSol: candidate.priceSol, highPriceSol: candidate.priceSol, entryMarketCapSol: candidate.marketCapSol, currentMarketCapSol: candidate.marketCapSol, entryMarketCapUsd: candidate.marketCapUsd, currentMarketCapUsd: candidate.marketCapUsd, amountSol: quote.amountSol, actualCostSol, remainingPercent: 100, openedAt: Date.now(), buySignature: signature, status: "open", execution: "live", source: "new-token" };
       setPositions((current) => [position, ...current]);
       newPairsEntryFailureStreak.current = 0;
-      addExecutionActivity(`Bought ${position.symbol}`, `${quote.amountSol} SOL · ${quote.impactPercent.toFixed(1)}% quoted impact · ${signature.slice(0, 8)}…`, "good", position.mint);
+      addExecutionActivity(`Bought ${position.symbol}`, `${quote.amountSol} SOL · ${quote.impactPercent.toFixed(1)}% quoted impact · ${signature.slice(0, 8)}…${executionDetail ? ` · ${executionDetail}` : ""}`, "good", position.mint);
       void refreshBalance();
     } catch (caught) {
       const reason = describeLiveTradeFailure(caught);
@@ -1077,6 +1081,7 @@ export default function LockstepApp() {
         return;
       }
       liveTradeInFlight.current = true;
+      let executionDetail = "";
       try {
         const balanceBefore = freshBalance;
         const signature = await buildSignAndSendTrade({
@@ -1087,6 +1092,7 @@ export default function LockstepApp() {
           slippagePercent: migrationExecutionSettings.slippage,
           pool: "pump-amm",
           knownBalanceSol: freshBalance,
+          signalObservedAt: Number(triggerCandidate.observedAt ?? Date.now()),
           freshTransactionRetries: 2,
           shouldRetryFreshTransaction: async () => {
             if (Date.now() >= watchDeadline || engineModeRef.current !== "active" || strategyModeRef.current !== migrationMode || positionsRef.current.some((position) => position.mint === candidate.mint)) return false;
@@ -1104,7 +1110,8 @@ export default function LockstepApp() {
               return false;
             }
           },
-          onFreshTransactionRetry: (attempt) => addExecutionActivity(`Retrying ${candidate.symbol}`, `${triggerReceipt} · PumpSwap slippage rejected the previous quote · rebuilding fresh transaction (${attempt}/3)`, "neutral", candidate.mint),
+          onFreshTransactionRetry: (attempt, diagnostics) => addExecutionActivity(`Retrying ${candidate.symbol}`, `${triggerReceipt} · PumpSwap slippage rejected the previous quote${diagnostics ? ` · ${formatLiveExecutionDiagnostics(diagnostics)}` : ""} · rebuilding fresh transaction (${attempt}/3)`, "neutral", candidate.mint),
+          onExecutionDiagnostics: (diagnostics) => { executionDetail = formatLiveExecutionDiagnostics(diagnostics); },
         });
         const balanceAfter = await getChangedBalance(signingKeypair.publicKey.toBase58(), balanceBefore, "lower");
         const actualCostSol = Math.max(executableBuyAmount, balanceBefore - balanceAfter);
@@ -1122,7 +1129,7 @@ export default function LockstepApp() {
         };
         setPositions((current) => [livePosition, ...current]);
         migrationEntryFailureStreak.current = 0;
-        addExecutionActivity(`Live bought ${livePosition.symbol}`, `${triggerReceipt} · bought ${executableBuyAmount.toFixed(4)} SOL at ${formatUsdMarketCap(livePosition.entryMarketCapUsd)} · ${signature.slice(0, 8)}… · ${Math.max(0, Math.round((Date.now() - migrationStartedAt) / 1000))}s after migration`, "good", livePosition.mint);
+        addExecutionActivity(`Live bought ${livePosition.symbol}`, `${triggerReceipt} · bought ${executableBuyAmount.toFixed(4)} SOL at ${formatUsdMarketCap(livePosition.entryMarketCapUsd)} · ${signature.slice(0, 8)}… · ${Math.max(0, Math.round((Date.now() - migrationStartedAt) / 1000))}s after migration${executionDetail ? ` · ${executionDetail}` : ""}`, "good", livePosition.mint);
         void refreshBalance();
       } catch (error) {
         liveEntryInFlight.current.delete(candidate.mint);

@@ -44,6 +44,13 @@ export default defineConfig(async () => {
   const { cloudflare } = await import("@cloudflare/vite-plugin");
 
   return {
+    // bigint-buffer probes optional native bindings during SSR. Cloudflare's
+    // ESM runtime has no Node __filename global; a harmless stable value lets
+    // the probe fall back to its pure-JS implementation instead of producing
+    // an asynchronous render error after the response has completed.
+    define: {
+      __filename: JSON.stringify("lockstep-worker.js"),
+    },
     server: {
       host: "0.0.0.0",
       allowedHosts: ["terminal.local"],
