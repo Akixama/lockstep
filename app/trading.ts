@@ -114,6 +114,7 @@ const ESTIMATED_COMPUTE_UNITS = 300_000;
 const PRIORITY_FEE_CACHE_MS = 15_000;
 const PUMP_SWAP_PREPARATION_TTL_MS = 5 * 60_000;
 const MAX_PREPARED_PUMP_SWAP_POOLS = 64;
+const TRADE_STREAM_FAILURE_GRACE_MS = 5_000;
 
 let cachedPriorityFeeSol = DEFAULT_PRIORITY_FEE_SOL;
 let priorityFeeExpiresAt = 0;
@@ -1025,6 +1026,7 @@ export function openMigrationFeed(
   let pendingTradeStream: EventSource | null = null;
   let tradeStreamRevision = 0;
   let tradeStreamRebuildTimer: number | null = null;
+  let tradeStreamFailureTimer: number | null = null;
 
   const notifyTradeStatus = (status: TokenTradeStreamStatus) => {
     tradeListeners.forEach((listeners) => listeners.forEach((listener) => listener.onStatus?.(status)));
@@ -1065,6 +1067,8 @@ export function openMigrationFeed(
     const mints = [...tradeListeners.keys()];
     if (mints.length === 0) {
       tradeStreamRevision += 1;
+      if (tradeStreamFailureTimer !== null) window.clearTimeout(tradeStreamFailureTimer);
+      tradeStreamFailureTimer = null;
       pendingTradeStream?.close();
       activeTradeStream?.close();
       pendingTradeStream = null;
@@ -1081,8 +1085,16 @@ export function openMigrationFeed(
     notifyTradeStatus("connecting");
     nextStream.addEventListener("message", handleTradeFrame);
     nextStream.addEventListener("open", () => {
-      if (revision !== tradeStreamRevision || pendingTradeStream !== nextStream) {
+      const isPendingStream = pendingTradeStream === nextStream;
+      const isActiveReconnect = activeTradeStream === nextStream;
+      if (revision !== tradeStreamRevision || (!isPendingStream && !isActiveReconnect)) {
         nextStream.close();
+        return;
+      }
+      if (tradeStreamFailureTimer !== null) window.clearTimeout(tradeStreamFailureTimer);
+      tradeStreamFailureTimer = null;
+      if (isActiveReconnect) {
+        notifyTradeStatus("live");
         return;
       }
       const previousStream = activeTradeStream;
@@ -1093,7 +1105,13 @@ export function openMigrationFeed(
     });
     nextStream.addEventListener("error", () => {
       if (revision !== tradeStreamRevision || (pendingTradeStream !== nextStream && activeTradeStream !== nextStream)) return;
-      notifyTradeStatus("error");
+      notifyTradeStatus("connecting");
+      if (tradeStreamFailureTimer === null) {
+        tradeStreamFailureTimer = window.setTimeout(() => {
+          tradeStreamFailureTimer = null;
+          notifyTradeStatus("error");
+        }, TRADE_STREAM_FAILURE_GRACE_MS);
+      }
       if (pendingTradeStream === nextStream) {
         pendingTradeStream = null;
         nextStream.close();
@@ -1193,6 +1211,7 @@ export function openMigrationFeed(
     stopped = true;
     if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
     if (tradeStreamRebuildTimer !== null) window.clearTimeout(tradeStreamRebuildTimer);
+    if (tradeStreamFailureTimer !== null) window.clearTimeout(tradeStreamFailureTimer);
     pendingTradeStream?.close();
     activeTradeStream?.close();
     tradeListeners.clear();

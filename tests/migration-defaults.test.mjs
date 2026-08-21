@@ -64,6 +64,9 @@ test("Migration feed consumes the protected server relay for metered token trade
   assert.match(source, /new EventSource\(`\/api\/pumpportal-trades\?\$\{params\.toString\(\)\}`\)/);
   assert.equal((source.match(/new EventSource/g) ?? []).length, 1);
   assert.match(source, /const tradeListeners = new Map/);
+  assert.match(source, /TRADE_STREAM_FAILURE_GRACE_MS/);
+  assert.match(source, /isActiveReconnect/);
+  assert.match(source, /notifyTradeStatus\("connecting"\)/);
   assert.match(source, /mints\.forEach\(\(mint\) => params\.append\("mint", mint\)\)/);
   assert.doesNotMatch(source, /PUMPPORTAL_API_KEY/);
   assert.equal((source.match(/new WebSocket/g) ?? []).length, 2);
