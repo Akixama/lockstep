@@ -208,12 +208,13 @@ export function warmPumpSwapBuy(mint: string, user: PublicKey) {
   });
 }
 
-async function buildLocalPumpSwapBuyTransaction({ keypair, mint, amountSol, slippagePercent, priorityFeeSol }: {
+async function buildLocalPumpSwapBuyTransaction({ keypair, mint, amountSol, slippagePercent, priorityFeeSol, entryGuard }: {
   keypair: Keypair;
   mint: string;
   amountSol: number;
   slippagePercent: number;
   priorityFeeSol: number;
+  entryGuard?: { referenceMarketCapUsd: number; maximumMarketCapUsd: number; maximumImpactPercent: number; solUsdPrice: number };
 }) {
   const key = pumpSwapPreparationKey(mint, keypair.publicKey);
   let prepared = await preparePumpSwapState(mint, keypair.publicKey);
@@ -266,6 +267,19 @@ async function buildLocalPumpSwapBuyTransaction({ keypair, mint, amountSol, slip
     creator: pool.creator,
     feeConfig: state.feeConfig,
   });
+  if (entryGuard) {
+    const estimatedTokensOut = Number(quote.base.toString()) / (10 ** Number(state.baseMintAccount.decimals));
+    const projectedFillMarketCapUsd = amountSol / estimatedTokensOut * 1_000_000_000 * entryGuard.solUsdPrice;
+    const projectedImpactPercent = (projectedFillMarketCapUsd / entryGuard.referenceMarketCapUsd - 1) * 100;
+    if (!Number.isFinite(projectedFillMarketCapUsd)
+      || projectedFillMarketCapUsd > entryGuard.maximumMarketCapUsd
+      || !Number.isFinite(projectedImpactPercent)
+      || projectedImpactPercent > entryGuard.maximumImpactPercent) {
+      throw new LiveTradeEntryGuardError(
+        `Projected confirmed fill $${projectedFillMarketCapUsd.toFixed(0)} MC · ${Math.max(0, projectedImpactPercent).toFixed(1)}% impact exceeds the entry protection`,
+      );
+    }
+  }
   const slippageScale = 100_000_000;
   const slippageUnits = Math.min(slippageScale, Math.max(0, Math.floor(slippagePercent * 1_000_000)));
   const minBaseAmountOut = quote.base.mul(new BN(slippageScale - slippageUnits)).div(new BN(slippageScale));
@@ -464,6 +478,13 @@ export function describeLiveTradeFailure(error: unknown): string {
   return `${rawMessage}${diagnostic}`;
 }
 
+export class LiveTradeEntryGuardError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "LiveTradeEntryGuardError";
+  }
+}
+
 async function buildRemoteTradeTransaction({ keypair, action, mint, amount, slippagePercent, pool, priorityFeeSol }: { keypair: Keypair; action: "buy" | "sell"; mint: string; amount: number | string; slippagePercent: number; pool: "auto" | "pump" | "pump-amm"; priorityFeeSol: number }) {
   const response = await fetch("/api/trade", {
     method: "POST",
@@ -523,7 +544,7 @@ export function formatLiveExecutionDiagnostics(value: unknown) {
   ].filter(Boolean).join(" · ");
 }
 
-async function attemptTrade({ keypair, action, mint, amount, slippagePercent, pool, priorityFeeSol, knownBalanceSol, attempt, signalObservedAt }: { keypair: Keypair; action: "buy" | "sell"; mint: string; amount: number | string; slippagePercent: number; pool: "auto" | "pump" | "pump-amm"; priorityFeeSol: number; knownBalanceSol?: number; attempt: number; signalObservedAt?: number }) {
+async function attemptTrade({ keypair, action, mint, amount, slippagePercent, pool, priorityFeeSol, knownBalanceSol, attempt, signalObservedAt, entryGuard }: { keypair: Keypair; action: "buy" | "sell"; mint: string; amount: number | string; slippagePercent: number; pool: "auto" | "pump" | "pump-amm"; priorityFeeSol: number; knownBalanceSol?: number; attempt: number; signalObservedAt?: number; entryGuard?: { referenceMarketCapUsd: number; maximumMarketCapUsd: number; maximumImpactPercent: number; solUsdPrice: number } }) {
   const attemptStartedAt = performance.now();
   const diagnostics: LiveExecutionDiagnostics = {
     attempt,
@@ -562,8 +583,13 @@ async function attemptTrade({ keypair, action, mint, amount, slippagePercent, po
     if (action === "buy" && pool === "pump-amm" && typeof amount === "number") {
       try {
         diagnostics.builder = "local-pumpswap";
-        transaction = await buildLocalPumpSwapBuyTransaction({ keypair, mint, amountSol: amount, slippagePercent, priorityFeeSol });
+        transaction = await buildLocalPumpSwapBuyTransaction({ keypair, mint, amountSol: amount, slippagePercent, priorityFeeSol, entryGuard });
       } catch (error) {
+        if (error instanceof LiveTradeEntryGuardError) throw error;
+        if (entryGuard) {
+          const reason = error instanceof Error ? error.message : "fresh quote unavailable";
+          throw new LiveTradeEntryGuardError(`Entry protection could not verify a fresh PumpSwap fill: ${reason}`);
+        }
         // Preserve availability if a newly migrated pool is not indexed by the
         // read RPC yet. The existing PumpPortal builder remains a safe fallback.
         diagnostics.builder = "remote-fallback";
@@ -647,7 +673,7 @@ async function enrichLiveTradeError(error: LiveTradeError) {
   return error;
 }
 
-export async function buildSignAndSendTrade({ keypair, action, mint, amount, slippagePercent, pool, knownBalanceSol, signalObservedAt, freshTransactionRetries = 0, shouldRetryFreshTransaction, onFreshTransactionRetry, onExecutionDiagnostics }: {
+export async function buildSignAndSendTrade({ keypair, action, mint, amount, slippagePercent, pool, knownBalanceSol, signalObservedAt, entryGuard, freshTransactionRetries = 0, shouldRetryFreshTransaction, onFreshTransactionRetry, onExecutionDiagnostics }: {
   keypair: Keypair;
   action: "buy" | "sell";
   mint: string;
@@ -656,6 +682,7 @@ export async function buildSignAndSendTrade({ keypair, action, mint, amount, sli
   pool?: "auto" | "pump" | "pump-amm";
   knownBalanceSol?: number;
   signalObservedAt?: number;
+  entryGuard?: { referenceMarketCapUsd: number; maximumMarketCapUsd: number; maximumImpactPercent: number; solUsdPrice: number };
   freshTransactionRetries?: number;
   shouldRetryFreshTransaction?: () => Promise<boolean>;
   onFreshTransactionRetry?: (attempt: number, diagnostics?: LiveExecutionDiagnostics) => void;
@@ -671,7 +698,7 @@ export async function buildSignAndSendTrade({ keypair, action, mint, amount, sli
     try {
       // The cache is refreshed in the background; fee lookup is no longer on
       // the latency-critical path between detecting the rug and submitting.
-      const result = await attemptTrade({ keypair, action, mint, amount, slippagePercent, pool: activePool, priorityFeeSol: getCachedCompetitivePriorityFeeSol(), knownBalanceSol, attempt: attempts, signalObservedAt });
+      const result = await attemptTrade({ keypair, action, mint, amount, slippagePercent, pool: activePool, priorityFeeSol: getCachedCompetitivePriorityFeeSol(), knownBalanceSol, attempt: attempts, signalObservedAt, entryGuard });
       onExecutionDiagnostics?.(result.diagnostics);
       return result.signature;
     } catch (caught) {

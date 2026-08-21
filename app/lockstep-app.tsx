@@ -9,7 +9,7 @@ import { gcm } from "@noble/ciphers/aes";
 import { pbkdf2Async } from "@noble/hashes/pbkdf2";
 import { sha256 } from "@noble/hashes/sha256";
 import { utf8ToBytes } from "@noble/hashes/utils";
-import { buildExactPaperBuy, buildSignAndSendTrade, describeLiveTradeFailure, fetchLiveBuyQuote, fetchPumpPrice, formatLiveExecutionDiagnostics, isRetryableLiveTradeFailure, openLaunchFeed, openMigrationFeed, verifyMigrationCandidate, warmLiveTradePreparation, warmPumpSwapBuy, type LaunchCandidate, type LivePosition, type TokenTradeWatcher } from "./trading";
+import { buildExactPaperBuy, buildSignAndSendTrade, describeLiveTradeFailure, fetchLiveBuyQuote, fetchPumpPrice, formatLiveExecutionDiagnostics, isRetryableLiveTradeFailure, LiveTradeEntryGuardError, openLaunchFeed, openMigrationFeed, verifyMigrationCandidate, warmLiveTradePreparation, warmPumpSwapBuy, type LaunchCandidate, type LivePosition, type TokenTradeWatcher } from "./trading";
 
 type StoredWallet = {
   version: 1;
@@ -61,6 +61,7 @@ const migrationDefaults = {
   buyAmount: 5,
   slippage: 50,
   exitImpact: 15,
+  maxEntryImpact: 15,
   maxPositions: 1,
   dailyLoss: 5,
   takeProfit: 300,
@@ -231,6 +232,35 @@ async function getChangedBalance(address: string, previous: number, direction: "
     await new Promise((resolve) => setTimeout(resolve, 300));
   }
   return latest;
+}
+
+async function getConfirmedBuyFill(signature: string, owner: string, mint: string, amountSol: number, solUsdPrice: number) {
+  type TokenBalance = { owner?: string; mint?: string; uiTokenAmount?: { amount?: string; decimals?: number } };
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const response = await fetch("/api/rpc", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ method: "getTransaction", params: [signature, { commitment: "confirmed", encoding: "jsonParsed", maxSupportedTransactionVersion: 0 }] }),
+    });
+    const payload = await response.json();
+    const meta = payload.result?.meta;
+    const preBalances = (meta?.preTokenBalances ?? []) as TokenBalance[];
+    const postBalances = (meta?.postTokenBalances ?? []) as TokenBalance[];
+    const matchingBalance = [...postBalances, ...preBalances].find((balance) => balance.owner === owner && balance.mint === mint);
+    const decimals = Number(matchingBalance?.uiTokenAmount?.decimals);
+    const totalRaw = (items: TokenBalance[]) => items
+      .filter((balance) => balance.owner === owner && balance.mint === mint)
+      .reduce((sum, balance) => sum + BigInt(balance.uiTokenAmount?.amount ?? "0"), 0n);
+    const receivedRaw = totalRaw(postBalances) - totalRaw(preBalances);
+    const tokensReceived = Number(receivedRaw) / (10 ** decimals);
+    if (response.ok && receivedRaw > 0n && Number.isFinite(tokensReceived) && tokensReceived > 0) {
+      const entryPriceSol = amountSol / tokensReceived;
+      const entryMarketCapSol = entryPriceSol * 1_000_000_000;
+      return { entryPriceSol, entryMarketCapSol, entryMarketCapUsd: entryMarketCapSol * solUsdPrice, tokensReceived };
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  return null;
 }
 
 export default function LockstepApp() {
@@ -1093,6 +1123,12 @@ export default function LockstepApp() {
           pool: "pump-amm",
           knownBalanceSol: freshBalance,
           signalObservedAt: Number(triggerCandidate.observedAt ?? Date.now()),
+          entryGuard: {
+            referenceMarketCapUsd: executionMarketCapUsd,
+            maximumMarketCapUsd: migrationExecutionSettings.boostEntryMarketCapUsd,
+            maximumImpactPercent: migrationExecutionSettings.maxEntryImpact,
+            solUsdPrice,
+          },
           freshTransactionRetries: 2,
           shouldRetryFreshTransaction: async () => {
             if (Date.now() >= watchDeadline || engineModeRef.current !== "active" || strategyModeRef.current !== migrationMode || positionsRef.current.some((position) => position.mint === candidate.mint)) return false;
@@ -1115,8 +1151,12 @@ export default function LockstepApp() {
         });
         const balanceAfter = await getChangedBalance(signingKeypair.publicKey.toBase58(), balanceBefore, "lower");
         const actualCostSol = Math.max(executableBuyAmount, balanceBefore - balanceAfter);
+        const confirmedFill = await getConfirmedBuyFill(signature, signingKeypair.publicKey.toBase58(), candidate.mint, executableBuyAmount, solUsdPrice);
         const livePosition: LivePosition = {
           ...basePosition,
+          entryPriceSol: confirmedFill?.entryPriceSol ?? basePosition.entryPriceSol,
+          entryMarketCapSol: confirmedFill?.entryMarketCapSol ?? basePosition.entryMarketCapSol,
+          entryMarketCapUsd: confirmedFill?.entryMarketCapUsd ?? basePosition.entryMarketCapUsd,
           buySignature: signature,
           actualCostSol,
           migrationExitPlan: {
@@ -1129,11 +1169,16 @@ export default function LockstepApp() {
         };
         setPositions((current) => [livePosition, ...current]);
         migrationEntryFailureStreak.current = 0;
-        addExecutionActivity(`Live bought ${livePosition.symbol}`, `${triggerReceipt} · bought ${executableBuyAmount.toFixed(4)} SOL at ${formatUsdMarketCap(livePosition.entryMarketCapUsd)} · ${signature.slice(0, 8)}… · ${Math.max(0, Math.round((Date.now() - migrationStartedAt) / 1000))}s after migration${executionDetail ? ` · ${executionDetail}` : ""}`, "good", livePosition.mint);
+        addExecutionActivity(`Live bought ${livePosition.symbol}`, `${triggerReceipt} · confirmed fill ${formatUsdMarketCap(livePosition.entryMarketCapUsd)}${confirmedFill ? ` from ${confirmedFill.tokensReceived.toFixed(2)} tokens` : " · fill details unavailable"} · ${signature.slice(0, 8)}… · ${Math.max(0, Math.round((Date.now() - migrationStartedAt) / 1000))}s after migration${executionDetail ? ` · ${executionDetail}` : ""}`, "good", livePosition.mint);
         void refreshBalance();
       } catch (error) {
         liveEntryInFlight.current.delete(candidate.mint);
         const reason = describeLiveTradeFailure(error);
+        if (error instanceof LiveTradeEntryGuardError) {
+          migrationEntryFailureStreak.current = 0;
+          addExecutionActivity(`Live entry protected: ${candidate.symbol}`, `${triggerReceipt} · ${reason} · no transaction submitted`, "warn", candidate.mint);
+          return;
+        }
         if (isRetryableLiveTradeFailure(error)) {
           migrationEntryFailureStreak.current = 0;
           addExecutionActivity(`Live entry missed: ${candidate.symbol}`, `${triggerReceipt} · ${reason} · fresh retries exhausted, still scanning`, "warn", candidate.mint);
@@ -1551,7 +1596,7 @@ export default function LockstepApp() {
             <div className="panel-heading"><div><small>STRATEGY</small><h2>{paperMode ? "Migration Paper Lab" : migrationLiveMode ? "Migration Live" : "New Pairs Live"}</h2></div><button className="text-button" onClick={() => setSettingsOpen(true)}>EDIT</button></div>
             <div className="strategy-switch" role="group" aria-label="Trading strategy"><button className={migrationLiveMode ? "selected danger-edge" : ""} onClick={() => changeStrategy("migration-live")}><b>Migration Live</b><small>Real feed · real SOL</small></button><button className={strategyMode === "new-pairs-live" ? "selected danger-edge" : ""} onClick={() => changeStrategy("new-pairs-live")}><b>New Pairs Live</b><small>Real feed · real SOL</small></button><button className={paperMode ? "selected paper-choice" : "paper-choice"} onClick={() => changeStrategy("migration-paper")}><b>Paper Lab</b><small>Fake SOL · isolated</small></button></div>
             <div className="order-size"><span>{paperMode ? "PAPER ORDER SIZE" : "REAL ORDER SIZE"}</span><b>{strategyMode === "new-pairs-live" ? `${newPairsSettings.buyAmount} → ${newPairsSettings.adaptiveBuyAmount}` : `${activeSettings.buyAmount}`} <small>{paperMode ? "FAKE SOL" : "SOL"}</small></b></div>
-            <div className="strategy-rules"><Rule label="Max positions" value={String(activeSettings.maxPositions)} /><Rule label="Daily loss limit" value={`${activeSettings.dailyLoss} ${paperMode ? "fake SOL" : "SOL"}`} danger />{strategyMode !== "new-pairs-live" ? <><Rule label="Entry" value={`${formatUsdMarketCap(migrationDisplaySettings.boostEntryMinMarketCapUsd)}–${formatUsdMarketCap(migrationDisplaySettings.boostEntryMarketCapUsd)}`} good /><Rule label={paperMode ? "Exact paper order" : "Exact live order"} value={`${migrationDisplaySettings.buyAmount} ${paperMode ? "fake SOL" : "SOL"}`} danger /><Rule label="Buy slippage" value={`${migrationDisplaySettings.slippage}%`} danger /><Rule label="Sell slippage" value={`${migrationDisplaySettings.exitImpact}%`} danger /><Rule label="Timed sell" value={`${migrationDisplaySettings.boostSellSlicePercent}% remaining every ${migrationDisplaySettings.boostSellIntervalSeconds}s`} /><Rule label="Profit exit" value={`+${migrationDisplaySettings.takeProfit}% · sell all`} good /><Rule label="Hard exit" value="5 min after migration" /></> : <><Rule label="Stop loss" value={`−${activeSettings.stopLoss}%`} danger /><Rule label="Quote-up size" value={`${newPairsSettings.adaptiveBuyAmount} SOL`} good /><Rule label="Live impact gate" value={`<${newPairsSettings.maxQuoteImpact}%`} /><Rule label="Take profit" value={`+${activeSettings.takeProfit}%`} good /><Rule label="Maximum hold" value={`${activeSettings.maxHold}s`} /><Rule label="Transaction slippage" value={`${activeSettings.slippage}%`} /></>}</div>
+            <div className="strategy-rules"><Rule label="Max positions" value={String(activeSettings.maxPositions)} /><Rule label="Daily loss limit" value={`${activeSettings.dailyLoss} ${paperMode ? "fake SOL" : "SOL"}`} danger />{strategyMode !== "new-pairs-live" ? <><Rule label="Entry" value={`${formatUsdMarketCap(migrationDisplaySettings.boostEntryMinMarketCapUsd)}–${formatUsdMarketCap(migrationDisplaySettings.boostEntryMarketCapUsd)}`} good /><Rule label="Maximum entry impact" value={`<${migrationDisplaySettings.maxEntryImpact}%`} /><Rule label={paperMode ? "Exact paper order" : "Exact live order"} value={`${migrationDisplaySettings.buyAmount} ${paperMode ? "fake SOL" : "SOL"}`} danger /><Rule label="Buy slippage" value={`${migrationDisplaySettings.slippage}%`} danger /><Rule label="Sell slippage" value={`${migrationDisplaySettings.exitImpact}%`} danger /><Rule label="Timed sell" value={`${migrationDisplaySettings.boostSellSlicePercent}% remaining every ${migrationDisplaySettings.boostSellIntervalSeconds}s`} /><Rule label="Profit exit" value={`+${migrationDisplaySettings.takeProfit}% · sell all`} good /><Rule label="Hard exit" value="5 min after migration" /></> : <><Rule label="Stop loss" value={`−${activeSettings.stopLoss}%`} danger /><Rule label="Quote-up size" value={`${newPairsSettings.adaptiveBuyAmount} SOL`} good /><Rule label="Live impact gate" value={`<${newPairsSettings.maxQuoteImpact}%`} /><Rule label="Take profit" value={`+${activeSettings.takeProfit}%`} good /><Rule label="Maximum hold" value={`${activeSettings.maxHold}s`} /><Rule label="Transaction slippage" value={`${activeSettings.slippage}%`} /></>}</div>
             <div className="browser-note"><i>◉</i><span><b>{paperMode ? "Isolated paper execution" : "Browser-bound real execution"}</b><small>{paperMode ? "No code path in this lab can sign or submit a transaction." : "Keep this tab open and wallet unlocked. Live activation is always confirmed separately."}</small></span></div>
             {paperMode && <button className="refresh-button" onClick={resetPaperWallet}>↻ Reset paper wallet to {migrationSettings.paperStartingBalance.toFixed(2)} fake SOL</button>}
           </aside>
@@ -1647,7 +1692,7 @@ function SettingsDrawer({ initialMode, migrationSettings, migrationLiveSettings,
     ? setMigrationDraft((current) => ({ ...current, [key]: value }))
     : setMigrationLiveDraft((current) => ({ ...current, [key]: value }));
   const field = (label: string, key: keyof typeof defaults, suffix: string | undefined, step: number) => <NumberField label={label} suffix={suffix} value={draft[key]} step={step} onChange={(value) => set(key, value)} />;
-  const normalizedMigration = (value: typeof migrationDefaults) => ({ ...value, boostEntryMinMarketCapUsd: Math.min(value.boostEntryMinMarketCapUsd, value.boostEntryMarketCapUsd), boostEntryMarketCapUsd: Math.max(value.boostEntryMinMarketCapUsd, value.boostEntryMarketCapUsd) });
+  const normalizedMigration = (value: typeof migrationDefaults) => ({ ...value, maxEntryImpact: Math.min(100, Math.max(0, value.maxEntryImpact)), boostEntryMinMarketCapUsd: Math.min(value.boostEntryMinMarketCapUsd, value.boostEntryMarketCapUsd), boostEntryMarketCapUsd: Math.max(value.boostEntryMinMarketCapUsd, value.boostEntryMarketCapUsd) });
 
   return <div className="drawer-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
     <aside className="settings-drawer">
@@ -1660,7 +1705,7 @@ function SettingsDrawer({ initialMode, migrationSettings, migrationLiveSettings,
       <div className="settings-mode-note"><i>{paperMode ? "PAPER" : "LIVE"}</i><span><b>{paperMode ? "Migration Paper Lab" : mode === "migration-live" ? "Migration Live" : "New Pairs Live"}</b><small>{paperMode ? "A separate fake-SOL laboratory that cannot sign transactions." : mode === "migration-live" ? "The migration strategy signs real mainnet entries and exits." : "Fresh Pump.fun launches with real wallet execution."}</small></span></div>
       <div className="settings-section"><h3>Entry</h3><div className="settings-grid">
         {field(migrationMode ? paperMode ? "Exact test order" : "Exact live order" : "Base order size", "buyAmount", paperMode ? "FAKE SOL" : "SOL", 0.001)}
-        {migrationMode ? <>{paperMode && field("Paper starting balance", "paperStartingBalance", "FAKE SOL", 0.1)}<NumberField label="Entry minimum" suffix="USD MC" value={migrationModeDraft.boostEntryMinMarketCapUsd} step={100} onChange={(value) => setMigrationValue("boostEntryMinMarketCapUsd", value)} /><NumberField label="Entry maximum" suffix="USD MC" value={migrationModeDraft.boostEntryMarketCapUsd} step={100} onChange={(value) => setMigrationValue("boostEntryMarketCapUsd", value)} />{field("Buy slippage", "slippage", "%", 0.1)}<NumberField label="Sell slippage" suffix="%" value={migrationModeDraft.exitImpact} step={0.1} onChange={(value) => setMigrationValue("exitImpact", value)} /></> : <>{field("Quote-up order size", "adaptiveBuyAmount", "SOL", 0.01)}{field("Maximum live impact", "maxQuoteImpact", "%", 0.1)}{field("Transaction slippage", "slippage", "%", 0.1)}</>}
+        {migrationMode ? <>{paperMode && field("Paper starting balance", "paperStartingBalance", "FAKE SOL", 0.1)}<NumberField label="Entry minimum" suffix="USD MC" value={migrationModeDraft.boostEntryMinMarketCapUsd} step={100} onChange={(value) => setMigrationValue("boostEntryMinMarketCapUsd", value)} /><NumberField label="Entry maximum" suffix="USD MC" value={migrationModeDraft.boostEntryMarketCapUsd} step={100} onChange={(value) => setMigrationValue("boostEntryMarketCapUsd", value)} /><NumberField label="Maximum entry impact" suffix="%" value={migrationModeDraft.maxEntryImpact} step={0.1} onChange={(value) => setMigrationValue("maxEntryImpact", value)} />{field("Buy slippage", "slippage", "%", 0.1)}<NumberField label="Sell slippage" suffix="%" value={migrationModeDraft.exitImpact} step={0.1} onChange={(value) => setMigrationValue("exitImpact", value)} /></> : <>{field("Quote-up order size", "adaptiveBuyAmount", "SOL", 0.01)}{field("Maximum live impact", "maxQuoteImpact", "%", 0.1)}{field("Transaction slippage", "slippage", "%", 0.1)}</>}
         {field("Maximum positions", "maxPositions", undefined, 1)}
       </div></div>
       {migrationMode && <div className="settings-section"><h3>Timed exit</h3><div className="settings-grid"><NumberField label="Sell each interval" suffix="% REMAINING" value={migrationModeDraft.boostSellSlicePercent} step={1} onChange={(value) => setMigrationValue("boostSellSlicePercent", value)} /><NumberField label="Sell interval" suffix="SEC" value={migrationModeDraft.boostSellIntervalSeconds} step={1} onChange={(value) => setMigrationValue("boostSellIntervalSeconds", value)} />{field("Instant full exit", "takeProfit", "% PROFIT", 10)}</div></div>}
