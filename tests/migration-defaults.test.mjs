@@ -72,6 +72,8 @@ test("Migration feed consumes the protected server relay for metered token trade
   assert.match(source, /observationSource: "trade-stream"/);
   assert.match(routeSource, /process\.env\.PUMPPORTAL_API_KEY/);
   assert.match(routeSource, /MAX_STREAMS_PER_IP/);
+  assert.match(routeSource, /const MAX_STREAMS_PER_IP = 32/);
+  assert.match(routeSource, /briefly overlaps the old/);
   assert.match(routeSource, /MAX_MINTS_PER_STREAM/);
   assert.match(routeSource, /searchParams\.getAll\("mint"\)/);
   assert.match(routeSource, /MAX_STARTS_PER_MINUTE/);

@@ -10,7 +10,12 @@ const MAX_MINTS_PER_STREAM = 96;
 const STREAM_LIFETIME_MS = 285_000;
 const HEARTBEAT_MS = 15_000;
 const MAX_ACTIVE_STREAMS = 128;
-const MAX_STREAMS_PER_IP = 8;
+// Replacing the browser's shared mint subscription briefly overlaps the old
+// and new SSE requests. Vercel can also take a heartbeat to observe a closed
+// downstream request, so a low per-IP cap falsely locked out active users
+// during bursts of migrations. The global and start-rate limits still bound
+// total usage while this larger allowance absorbs those short-lived leases.
+const MAX_STREAMS_PER_IP = 32;
 const MAX_STARTS_PER_MINUTE = 120;
 const MAX_TRACKED_IPS = 2_048;
 
