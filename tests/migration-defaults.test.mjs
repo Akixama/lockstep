@@ -11,6 +11,7 @@ const rpcRouteSourceUrl = new URL("../app/api/rpc/route.ts", import.meta.url);
 
 test("Migration Paper starts from its confirmed defaults instead of legacy settings", async () => {
   const source = await readFile(sourceUrl, "utf8");
+  const tradingSource = await readFile(tradingSourceUrl, "utf8");
 
   assert.match(source, /buyAmount:\s*5,/);
   assert.match(source, /buyAmount:\s*5,\s*\n\s*slippage:\s*50,/);
@@ -20,6 +21,7 @@ test("Migration Paper starts from its confirmed defaults instead of legacy setti
   assert.match(source, /boostEntryMarketCapUsd:\s*3500,/);
   assert.match(source, /boostMaximumFillMarketCapUsd:\s*4700,/);
   assert.match(source, /boostHardExitEnabled:\s*true,/);
+  assert.match(source, /boostMinimumRemainingSeconds:\s*60,/);
   assert.match(source, /buyPriorityFeeSol:\s*0\.01,/);
   assert.match(source, /sellPriorityFeeSol:\s*0\.001,/);
   assert.match(source, /lockstep\.settings\.migration\.v14/);
@@ -43,6 +45,13 @@ test("Migration Paper starts from its confirmed defaults instead of legacy setti
   assert.match(source, /if \(migrationSettings\.boostHardExitEnabled\) closePaperPosition/);
   assert.match(source, /role="switch"/);
   assert.match(source, /Full exit after five minutes/);
+  assert.match(source, /const entryDeadline = watchDeadline - minimumBoostRemainingSeconds \* 1000/);
+  assert.match(source, /while \(Date\.now\(\) < entryDeadline/);
+  assert.match(source, /latestSubmitAt:\s*entryDeadline/);
+  assert.match(source, /minimumRemainingSeconds:\s*minimumBoostRemainingSeconds/);
+  assert.match(source, /label="Stop new entries with"/);
+  assert.match(source, /setMigrationValue\("boostMinimumRemainingSeconds", value\)/);
+  assert.match(tradingSource, /Date\.now\(\) >= entryGuard\.latestSubmitAt/);
   assert.doesNotMatch(source, /nextSliceAt: current\.paperExitPlan\.nextSliceAt \+ current\.paperExitPlan\.intervalSeconds \* 1000/);
 });
 

@@ -81,6 +81,8 @@ type PumpSwapEntryGuard = {
   maximumEntryMarketCapUsd: number;
   maximumFillMarketCapUsd: number;
   solUsdPrice: number;
+  latestSubmitAt?: number;
+  minimumRemainingSeconds?: number;
 };
 
 export type LiveExecutionDiagnostics = {
@@ -676,6 +678,9 @@ async function attemptTrade({ keypair, action, mint, amount, slippagePercent, po
       }
     }
     finishPhase();
+    if (action === "buy" && entryGuard?.latestSubmitAt && Date.now() >= entryGuard.latestSubmitAt) {
+      throw new LiveTradeEntryGuardError(`Fewer than ${Math.max(0, Number(entryGuard.minimumRemainingSeconds ?? 0))} seconds remained in the BOOST before transaction submission`);
+    }
     const serializedTransaction = bytesToBase64(transaction.serialize());
     beginPhase("submit");
     if (Number.isFinite(signalObservedAt)) diagnostics.signalToSubmitMs = Math.max(0, Date.now() - Number(signalObservedAt));

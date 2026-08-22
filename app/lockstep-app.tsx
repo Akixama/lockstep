@@ -70,6 +70,7 @@ const migrationDefaults = {
   boostEntryMinMarketCapUsd: 1600,
   boostEntryMarketCapUsd: 3500,
   boostMaximumFillMarketCapUsd: 4700,
+  boostMinimumRemainingSeconds: 60,
   boostSellSlicePercent: 10,
   boostSellIntervalSeconds: 12,
   boostHardExitEnabled: true,
@@ -904,8 +905,10 @@ export default function LockstepApp() {
     migrationWatchInFlight.current.add(candidate.mint);
     const migrationStartedAt = Date.now() - Math.max(0, migrationAge) * 1000;
     const watchDeadline = migrationStartedAt + MIGRATION_WINDOW_SECONDS * 1000;
+    const minimumBoostRemainingSeconds = Math.min(MIGRATION_WINDOW_SECONDS - 1, Math.max(0, migrationExecutionSettings.boostMinimumRemainingSeconds));
+    const entryDeadline = watchDeadline - minimumBoostRemainingSeconds * 1000;
     const rugTriggerLabel = `${formatUsdMarketCap(migrationExecutionSettings.boostEntryMinMarketCapUsd)}–${formatUsdMarketCap(migrationExecutionSettings.boostEntryMarketCapUsd)}`;
-    addExecutionActivity(`${candidate.symbol} BOOST watch`, `${watchTokenTrades ? "Processed WebSocket + shared trade stream + backup polling" : "Backup polling"} for up to ${Math.max(0, Math.ceil((watchDeadline - Date.now()) / 1000))}s · waiting for the coin to enter ${rugTriggerLabel}`, "neutral", candidate.mint);
+    addExecutionActivity(`${candidate.symbol} BOOST watch`, `${watchTokenTrades ? "Processed WebSocket + shared trade stream + backup polling" : "Backup polling"} for up to ${Math.max(0, Math.ceil((entryDeadline - Date.now()) / 1000))}s · buying stops with ${minimumBoostRemainingSeconds}s of BOOST remaining · waiting for the coin to enter ${rugTriggerLabel}`, "neutral", candidate.mint);
     // LOGGING: every price check this watch performs (stream-confirm or
     // direct poll, success or failure) is now written to console so a
     // watch's full price history is searchable in Vercel's function logs by
@@ -922,7 +925,7 @@ export default function LockstepApp() {
     // an entry, no matter how much SOL landed on it. Entry now fires on any
     // observed mark inside [boostEntryMinMarketCapUsd, boostEntryMarketCapUsd],
     // spike or no spike.
-    while (Date.now() < watchDeadline && engineModeRef.current === "active" && strategyModeRef.current === migrationMode) {
+    while (Date.now() < entryDeadline && engineModeRef.current === "active" && strategyModeRef.current === migrationMode) {
       const streamedMark = streamedMarks.pop();
       if (streamedMark) {
         const streamedMarketCapUsd = marketCapUsdFor(streamedMark, solUsdPrice);
@@ -995,8 +998,8 @@ export default function LockstepApp() {
     stopTradeWatch?.();
     migrationWatchInFlight.current.delete(candidate.mint);
     if (!triggerCandidate) {
-      if (Date.now() >= watchDeadline) {
-        addExecutionActivity(`${candidate.symbol} BOOST watch expired`, `The coin did not enter ${rugTriggerLabel} during the five-minute window`, "neutral", candidate.mint);
+      if (Date.now() >= entryDeadline) {
+        addExecutionActivity(`${candidate.symbol} BOOST entry closed`, `No buy submitted because only ${minimumBoostRemainingSeconds}s remained · the coin did not enter ${rugTriggerLabel} before the configured cutoff`, "neutral", candidate.mint);
       } else {
         addExecutionActivity(`${candidate.symbol} watch cancelled`, `Automation left the active state mid-watch (mode: ${engineModeRef.current}) · this candidate was dropped`, "warn", candidate.mint);
       }
@@ -1039,8 +1042,8 @@ export default function LockstepApp() {
       }
     }
     const executionMarketCapUsd = marketCapUsdFor(candidate, solUsdPrice);
-    if (Date.now() >= watchDeadline) {
-      addExecutionActivity(`${paperExecution ? "Paper" : "Live"} entry missed: ${candidate.symbol}`, `${triggerReceipt} · the five-minute post-migration window expired before execution`, "warn", candidate.mint);
+    if (Date.now() >= entryDeadline) {
+      addExecutionActivity(`${paperExecution ? "Paper" : "Live"} entry protected: ${candidate.symbol}`, `${triggerReceipt} · fewer than ${minimumBoostRemainingSeconds}s remained in the BOOST · no transaction submitted`, "warn", candidate.mint);
       return;
     }
     if (candidate.isMayhemMode || !candidate.isStandardPumpfunMigration || !candidate.mint.endsWith("pump")) {
@@ -1143,6 +1146,8 @@ export default function LockstepApp() {
             maximumEntryMarketCapUsd: migrationExecutionSettings.boostEntryMarketCapUsd,
             maximumFillMarketCapUsd: migrationExecutionSettings.boostMaximumFillMarketCapUsd,
             solUsdPrice,
+            latestSubmitAt: entryDeadline,
+            minimumRemainingSeconds: minimumBoostRemainingSeconds,
           },
           freshTransactionRetries: 2,
           shouldRetryFreshTransaction: async () => {
@@ -1150,7 +1155,7 @@ export default function LockstepApp() {
             // reserve check in the same account read used for its fresh quote.
             // An HTTP market-cap request here only added latency and could veto
             // a valid retry using stale third-party data.
-            return Date.now() < watchDeadline
+            return Date.now() < entryDeadline
               && engineModeRef.current === "active"
               && strategyModeRef.current === migrationMode
               && !positionsRef.current.some((position) => position.mint === candidate.mint);
@@ -1716,6 +1721,7 @@ function SettingsDrawer({ initialMode, migrationSettings, migrationLiveSettings,
       boostEntryMinMarketCapUsd,
       boostEntryMarketCapUsd,
       boostMaximumFillMarketCapUsd: Math.max(boostEntryMarketCapUsd, value.boostMaximumFillMarketCapUsd),
+      boostMinimumRemainingSeconds: Math.min(MIGRATION_WINDOW_SECONDS - 1, Math.max(0, Math.round(value.boostMinimumRemainingSeconds))),
       buyPriorityFeeSol: Math.min(0.06, Math.max(0.000001, value.buyPriorityFeeSol)),
       sellPriorityFeeSol: Math.min(0.06, Math.max(0.000001, value.sellPriorityFeeSol)),
     };
@@ -1732,7 +1738,17 @@ function SettingsDrawer({ initialMode, migrationSettings, migrationLiveSettings,
       <div className="settings-mode-note"><i>{paperMode ? "PAPER" : "LIVE"}</i><span><b>{paperMode ? "Migration Paper Lab" : mode === "migration-live" ? "Migration Live" : "New Pairs Live"}</b><small>{paperMode ? "A separate fake-SOL laboratory that cannot sign transactions." : mode === "migration-live" ? "The migration strategy signs real mainnet entries and exits." : "Fresh Pump.fun launches with real wallet execution."}</small></span></div>
       <div className="settings-section"><h3>Entry</h3><div className="settings-grid">
         {field(migrationMode ? paperMode ? "Exact test order" : "Exact live order" : "Base order size", "buyAmount", paperMode ? "FAKE SOL" : "SOL", 0.001)}
-        {migrationMode ? <>{paperMode && field("Paper starting balance", "paperStartingBalance", "FAKE SOL", 0.1)}<NumberField label="Entry minimum" suffix="USD MC" value={migrationModeDraft.boostEntryMinMarketCapUsd} step={100} onChange={(value) => setMigrationValue("boostEntryMinMarketCapUsd", value)} /><NumberField label="Entry maximum" suffix="USD MC" value={migrationModeDraft.boostEntryMarketCapUsd} step={100} onChange={(value) => setMigrationValue("boostEntryMarketCapUsd", value)} /><NumberField label="Maximum average fill" suffix="USD MC" value={migrationModeDraft.boostMaximumFillMarketCapUsd} step={100} onChange={(value) => setMigrationValue("boostMaximumFillMarketCapUsd", value)} />{field("Buy slippage", "slippage", "%", 0.1)}<NumberField label="Sell slippage" suffix="%" value={migrationModeDraft.exitImpact} step={0.1} onChange={(value) => setMigrationValue("exitImpact", value)} /><NumberField label="Buy priority fee" suffix="SOL / TX" value={migrationModeDraft.buyPriorityFeeSol} step={0.001} max={0.06} onChange={(value) => setMigrationValue("buyPriorityFeeSol", value)} /><NumberField label="Sell priority fee" suffix="SOL / TX" value={migrationModeDraft.sellPriorityFeeSol} step={0.001} max={0.06} onChange={(value) => setMigrationValue("sellPriorityFeeSol", value)} /></> : <>{field("Quote-up order size", "adaptiveBuyAmount", "SOL", 0.01)}{field("Maximum live impact", "maxQuoteImpact", "%", 0.1)}{field("Transaction slippage", "slippage", "%", 0.1)}<NumberField label="Buy priority fee" suffix="SOL / TX" value={newPairsDraft.buyPriorityFeeSol} step={0.001} max={0.06} onChange={(value) => set("buyPriorityFeeSol", value)} /><NumberField label="Sell priority fee" suffix="SOL / TX" value={newPairsDraft.sellPriorityFeeSol} step={0.001} max={0.06} onChange={(value) => set("sellPriorityFeeSol", value)} /></>}
+        {migrationMode ? <>
+          {paperMode && field("Paper starting balance", "paperStartingBalance", "FAKE SOL", 0.1)}
+          <NumberField label="Entry minimum" suffix="USD MC" value={migrationModeDraft.boostEntryMinMarketCapUsd} step={100} onChange={(value) => setMigrationValue("boostEntryMinMarketCapUsd", value)} />
+          <NumberField label="Entry maximum" suffix="USD MC" value={migrationModeDraft.boostEntryMarketCapUsd} step={100} onChange={(value) => setMigrationValue("boostEntryMarketCapUsd", value)} />
+          <NumberField label="Maximum average fill" suffix="USD MC" value={migrationModeDraft.boostMaximumFillMarketCapUsd} step={100} onChange={(value) => setMigrationValue("boostMaximumFillMarketCapUsd", value)} />
+          <NumberField label="Stop new entries with" suffix="SEC BOOST LEFT" value={migrationModeDraft.boostMinimumRemainingSeconds} step={1} max={MIGRATION_WINDOW_SECONDS - 1} onChange={(value) => setMigrationValue("boostMinimumRemainingSeconds", value)} />
+          {field("Buy slippage", "slippage", "%", 0.1)}
+          <NumberField label="Sell slippage" suffix="%" value={migrationModeDraft.exitImpact} step={0.1} onChange={(value) => setMigrationValue("exitImpact", value)} />
+          <NumberField label="Buy priority fee" suffix="SOL / TX" value={migrationModeDraft.buyPriorityFeeSol} step={0.001} max={0.06} onChange={(value) => setMigrationValue("buyPriorityFeeSol", value)} />
+          <NumberField label="Sell priority fee" suffix="SOL / TX" value={migrationModeDraft.sellPriorityFeeSol} step={0.001} max={0.06} onChange={(value) => setMigrationValue("sellPriorityFeeSol", value)} />
+        </> : <>{field("Quote-up order size", "adaptiveBuyAmount", "SOL", 0.01)}{field("Maximum live impact", "maxQuoteImpact", "%", 0.1)}{field("Transaction slippage", "slippage", "%", 0.1)}<NumberField label="Buy priority fee" suffix="SOL / TX" value={newPairsDraft.buyPriorityFeeSol} step={0.001} max={0.06} onChange={(value) => set("buyPriorityFeeSol", value)} /><NumberField label="Sell priority fee" suffix="SOL / TX" value={newPairsDraft.sellPriorityFeeSol} step={0.001} max={0.06} onChange={(value) => set("sellPriorityFeeSol", value)} /></>}
         {field("Maximum positions", "maxPositions", undefined, 1)}
       </div></div>
       {migrationMode && <div className="settings-section"><h3>Timed exit</h3><div className="settings-grid"><NumberField label="Sell each interval" suffix="% REMAINING" value={migrationModeDraft.boostSellSlicePercent} step={1} onChange={(value) => setMigrationValue("boostSellSlicePercent", value)} /><NumberField label="Sell interval" suffix="SEC" value={migrationModeDraft.boostSellIntervalSeconds} step={1} onChange={(value) => setMigrationValue("boostSellIntervalSeconds", value)} />{field("Instant full exit", "takeProfit", "% PROFIT", 10)}<ToggleField label="Full exit after five minutes" checked={migrationModeDraft.boostHardExitEnabled} onChange={setHardExitEnabled} /></div></div>}
