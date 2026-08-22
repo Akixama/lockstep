@@ -715,12 +715,13 @@ async function enrichLiveTradeError(error: LiveTradeError) {
   return error;
 }
 
-export async function buildSignAndSendTrade({ keypair, action, mint, amount, slippagePercent, pool, knownBalanceSol, signalObservedAt, entryGuard, freshTransactionRetries = 0, shouldRetryFreshTransaction, onFreshTransactionRetry, onExecutionDiagnostics }: {
+export async function buildSignAndSendTrade({ keypair, action, mint, amount, slippagePercent, priorityFeeSol, pool, knownBalanceSol, signalObservedAt, entryGuard, freshTransactionRetries = 0, shouldRetryFreshTransaction, onFreshTransactionRetry, onExecutionDiagnostics }: {
   keypair: Keypair;
   action: "buy" | "sell";
   mint: string;
   amount: number | string;
   slippagePercent: number;
+  priorityFeeSol?: number;
   pool?: "auto" | "pump" | "pump-amm";
   knownBalanceSol?: number;
   signalObservedAt?: number;
@@ -740,7 +741,11 @@ export async function buildSignAndSendTrade({ keypair, action, mint, amount, sli
     try {
       // The cache is refreshed in the background; fee lookup is no longer on
       // the latency-critical path between detecting the rug and submitting.
-      const result = await attemptTrade({ keypair, action, mint, amount, slippagePercent, pool: activePool, priorityFeeSol: getCachedCompetitivePriorityFeeSol(), knownBalanceSol, attempt: attempts, signalObservedAt, entryGuard });
+      const configuredPriorityFeeSol = Number(priorityFeeSol);
+      const activePriorityFeeSol = Number.isFinite(configuredPriorityFeeSol) && configuredPriorityFeeSol > 0
+        ? Math.min(MAX_LIVE_PRIORITY_FEE_SOL, configuredPriorityFeeSol)
+        : getCachedCompetitivePriorityFeeSol();
+      const result = await attemptTrade({ keypair, action, mint, amount, slippagePercent, pool: activePool, priorityFeeSol: activePriorityFeeSol, knownBalanceSol, attempt: attempts, signalObservedAt, entryGuard });
       onExecutionDiagnostics?.(result.diagnostics);
       return result.signature;
     } catch (caught) {
@@ -791,7 +796,7 @@ export async function buildSignAndSendTrade({ keypair, action, mint, amount, sli
 // same routing risk live trades face, instead of testing an easier path.
 // Priority fee here stays fixed at the default: this build is never submitted
 // on-chain, so there is no race to bid into.
-export async function buildExactPaperBuy({ publicKey, mint, amountSol, slippagePercent }: { publicKey: string; mint: string; amountSol: number; slippagePercent: number }): Promise<PaperBuyBuild> {
+export async function buildExactPaperBuy({ publicKey, mint, amountSol, slippagePercent, priorityFeeSol = DEFAULT_PRIORITY_FEE_SOL }: { publicKey: string; mint: string; amountSol: number; slippagePercent: number; priorityFeeSol?: number }): Promise<PaperBuyBuild> {
   if (!Number.isFinite(amountSol) || amountSol <= 0) throw new Error("Simulation amount is invalid");
   const response = await fetch("/api/trade", {
     method: "POST",
@@ -803,7 +808,7 @@ export async function buildExactPaperBuy({ publicKey, mint, amountSol, slippageP
       amount: amountSol,
       denominatedInSol: "true",
       slippage: slippagePercent,
-      priorityFee: DEFAULT_PRIORITY_FEE_SOL,
+      priorityFee: Math.min(MAX_LIVE_PRIORITY_FEE_SOL, Math.max(0.000001, priorityFeeSol)),
       pool: "pump-amm",
     }),
   });

@@ -41,7 +41,6 @@ const MIGRATION_WINDOW_SECONDS = 300;
 const MIGRATION_WATCH_POLL_MS = 500;
 const PAPER_ESTIMATED_QUOTE_LIQUIDITY_SHARE = 0.2;
 const PAPER_TRADING_FEE_PERCENT = 1.25;
-const PAPER_PRIORITY_FEE_SOL = 0.01;
 
 const defaults = {
   buyAmount: 0.3,
@@ -54,6 +53,8 @@ const defaults = {
   takeProfit: 50,
   maxHold: 120,
   paperStartingBalance: 1,
+  buyPriorityFeeSol: 0.01,
+  sellPriorityFeeSol: 0.001,
 };
 
 const migrationDefaults = {
@@ -198,11 +199,11 @@ function estimatedPaperPriceImpactPercent(notionalSol: number, marketCapUsd: num
   return notionalSol / estimatedQuoteLiquiditySol * 100;
 }
 
-function executablePaperSellProceeds(grossProceedsSol: number, marketCapUsd: number | undefined, solUsdPrice: number, maximumImpactPercent: number) {
+function executablePaperSellProceeds(grossProceedsSol: number, marketCapUsd: number | undefined, solUsdPrice: number, maximumImpactPercent: number, priorityFeeSol: number) {
   const impactPercent = estimatedPaperPriceImpactPercent(grossProceedsSol, marketCapUsd, solUsdPrice);
   if (!Number.isFinite(impactPercent) || impactPercent > maximumImpactPercent) return { proceedsSol: 0, impactPercent, executable: false };
   const afterImpact = grossProceedsSol * (1 - impactPercent / 100);
-  const afterFees = afterImpact * (1 - PAPER_TRADING_FEE_PERCENT / 100) - PAPER_PRIORITY_FEE_SOL;
+  const afterFees = afterImpact * (1 - PAPER_TRADING_FEE_PERCENT / 100) - priorityFeeSol;
   return { proceedsSol: Math.max(0, afterFees), impactPercent, executable: afterFees > 0 };
 }
 
@@ -571,7 +572,8 @@ export default function LockstepApp() {
     try {
       const balanceBefore = await getBalance(keypairRef.current.publicKey.toBase58());
       const sellSlippage = position.source === "migration" ? migrationLiveSettings.exitImpact : newPairsSettings.slippage;
-      const signature = await buildSignAndSendTrade({ keypair: keypairRef.current, action: "sell", mint: position.mint, amount: "100%", slippagePercent: sellSlippage, pool: position.source === "migration" ? "pump-amm" : "auto", onExecutionDiagnostics: (diagnostics) => { executionDetail = formatLiveExecutionDiagnostics(diagnostics); } });
+      const sellPriorityFeeSol = position.source === "migration" ? migrationLiveSettings.sellPriorityFeeSol : newPairsSettings.sellPriorityFeeSol;
+      const signature = await buildSignAndSendTrade({ keypair: keypairRef.current, action: "sell", mint: position.mint, amount: "100%", slippagePercent: sellSlippage, priorityFeeSol: sellPriorityFeeSol, pool: position.source === "migration" ? "pump-amm" : "auto", onExecutionDiagnostics: (diagnostics) => { executionDetail = formatLiveExecutionDiagnostics(diagnostics); } });
       const balanceAfter = await getChangedBalance(keypairRef.current.publicKey.toBase58(), balanceBefore, "higher");
       const netProceeds = Math.max(0, balanceAfter - balanceBefore);
       const pnl = netProceeds - (position.actualCostSol ?? position.amountSol);
@@ -587,7 +589,7 @@ export default function LockstepApp() {
       mintExitInFlight.current.delete(position.mint);
       liveTradeInFlight.current = false;
     }
-  }, [addExecutionActivity, migrationLiveSettings.exitImpact, newPairsSettings.slippage, refreshBalance]);
+  }, [addExecutionActivity, migrationLiveSettings.exitImpact, migrationLiveSettings.sellPriorityFeeSol, newPairsSettings.sellPriorityFeeSol, newPairsSettings.slippage, refreshBalance]);
 
   const sellLiveMigrationSlice = useCallback(async (position: LivePosition) => {
     if (!keypairRef.current || !position.migrationExitPlan || exitInFlight.current.has(position.id) || mintExitInFlight.current.has(position.mint) || liveTradeInFlight.current) return;
@@ -599,7 +601,7 @@ export default function LockstepApp() {
     let executionDetail = "";
     try {
       const balanceBefore = await getBalance(keypairRef.current.publicKey.toBase58());
-      const signature = await buildSignAndSendTrade({ keypair: keypairRef.current, action: "sell", mint: position.mint, amount: `${slicePercent}%`, slippagePercent: migrationLiveSettings.exitImpact, pool: "pump-amm", onExecutionDiagnostics: (diagnostics) => { executionDetail = formatLiveExecutionDiagnostics(diagnostics); } });
+      const signature = await buildSignAndSendTrade({ keypair: keypairRef.current, action: "sell", mint: position.mint, amount: `${slicePercent}%`, slippagePercent: migrationLiveSettings.exitImpact, priorityFeeSol: migrationLiveSettings.sellPriorityFeeSol, pool: "pump-amm", onExecutionDiagnostics: (diagnostics) => { executionDetail = formatLiveExecutionDiagnostics(diagnostics); } });
       const balanceAfter = await getChangedBalance(keypairRef.current.publicKey.toBase58(), balanceBefore, "higher");
       const netProceeds = Math.max(0, balanceAfter - balanceBefore);
       const remainingCost = position.actualCostSol ?? position.amountSol;
@@ -618,7 +620,7 @@ export default function LockstepApp() {
       mintExitInFlight.current.delete(position.mint);
       liveTradeInFlight.current = false;
     }
-  }, [addExecutionActivity, migrationLiveSettings.exitImpact, refreshBalance]);
+  }, [addExecutionActivity, migrationLiveSettings.exitImpact, migrationLiveSettings.sellPriorityFeeSol, refreshBalance]);
 
   const handleCandidate = useCallback(async (candidate: LaunchCandidate) => {
     if (!keypairRef.current) return;
@@ -668,6 +670,7 @@ export default function LockstepApp() {
         mint: candidate.mint,
         amount: quote.amountSol,
         slippagePercent: newPairsSettings.slippage,
+        priorityFeeSol: newPairsSettings.buyPriorityFeeSol,
         knownBalanceSol: freshBalance,
         signalObservedAt,
         freshTransactionRetries: 2,
@@ -710,7 +713,7 @@ export default function LockstepApp() {
       entryInFlight.current = false;
       liveTradeInFlight.current = false;
     }
-  }, [addExecutionActivity, newPairsSettings.adaptiveBuyAmount, newPairsSettings.buyAmount, newPairsSettings.dailyLoss, newPairsSettings.maxPositions, newPairsSettings.maxQuoteImpact, newPairsSettings.slippage, realizedPnl, refreshBalance]);
+  }, [addExecutionActivity, newPairsSettings.adaptiveBuyAmount, newPairsSettings.buyAmount, newPairsSettings.buyPriorityFeeSol, newPairsSettings.dailyLoss, newPairsSettings.maxPositions, newPairsSettings.maxQuoteImpact, newPairsSettings.slippage, realizedPnl, refreshBalance]);
 
   const closePaperPosition = useCallback((position: LivePosition, reason: string) => {
     if (!paperPositionsRef.current.some((item) => item.id === position.id)) return;
@@ -721,7 +724,7 @@ export default function LockstepApp() {
     }
     const remainingCapital = position.amountSol * Math.max(0, position.remainingPercent) / 100;
     const grossProceeds = remainingCapital * ratio;
-    const quote = executablePaperSellProceeds(grossProceeds, position.currentMarketCapUsd, solUsdPrice, migrationSettings.exitImpact);
+    const quote = executablePaperSellProceeds(grossProceeds, position.currentMarketCapUsd, solUsdPrice, migrationSettings.exitImpact, migrationSettings.sellPriorityFeeSol);
     if (!quote.executable) {
       addExecutionActivity(`Paper exit retrying: ${position.symbol}`, `${reason} · estimated ${Number.isFinite(quote.impactPercent) ? quote.impactPercent.toFixed(1) : "unavailable"}% sell impact exceeds ${migrationSettings.exitImpact}% · position remains open`, "warn", position.mint);
       return;
@@ -738,7 +741,7 @@ export default function LockstepApp() {
     setPaperRealizedPnl(nextPnl);
     setPaperPositions(remaining);
     addExecutionActivity(`Paper exit: ${position.symbol}`, `${reason} · ${formatUsdMarketCap(position.entryMarketCapUsd)} → ${formatUsdMarketCap(position.currentMarketCapUsd)} · ${quote.impactPercent.toFixed(1)}% impact + fees · ${pnl >= 0 ? "+" : ""}${pnl.toFixed(4)} fake SOL`, pnl >= 0 ? "good" : "warn", position.mint);
-  }, [addExecutionActivity, migrationSettings.exitImpact, solUsdPrice]);
+  }, [addExecutionActivity, migrationSettings.exitImpact, migrationSettings.sellPriorityFeeSol, solUsdPrice]);
 
   const sellPaperSlice = useCallback((position: LivePosition) => {
     if (paperExitInFlight.current.has(position.id)) return;
@@ -751,7 +754,7 @@ export default function LockstepApp() {
       const slicePercent = Math.min(100, current.paperExitPlan.slicePercent);
       const soldCapital = current.amountSol * current.remainingPercent / 100 * slicePercent / 100;
       const grossProceeds = soldCapital * ratio;
-      const quote = executablePaperSellProceeds(grossProceeds, current.currentMarketCapUsd, solUsdPrice, migrationSettings.exitImpact);
+      const quote = executablePaperSellProceeds(grossProceeds, current.currentMarketCapUsd, solUsdPrice, migrationSettings.exitImpact, migrationSettings.sellPriorityFeeSol);
       if (!quote.executable) {
         const attemptedAt = Date.now();
         const deferred: LivePosition = {
@@ -801,7 +804,7 @@ export default function LockstepApp() {
     } finally {
       paperExitInFlight.current.delete(position.id);
     }
-  }, [addExecutionActivity, migrationSettings.exitImpact, solUsdPrice]);
+  }, [addExecutionActivity, migrationSettings.exitImpact, migrationSettings.sellPriorityFeeSol, solUsdPrice]);
 
   const handleMigrationCandidate = useCallback(async (unverifiedCandidate: LaunchCandidate, watchTokenTrades: TokenTradeWatcher | null = null) => {
     const migrationMode = strategyModeRef.current;
@@ -1130,6 +1133,7 @@ export default function LockstepApp() {
           mint: candidate.mint,
           amount: executableBuyAmount,
           slippagePercent: migrationExecutionSettings.slippage,
+          priorityFeeSol: migrationExecutionSettings.buyPriorityFeeSol,
           pool: "pump-amm",
           knownBalanceSol: freshBalance,
           signalObservedAt: Number(triggerCandidate.observedAt ?? Date.now()),
@@ -1211,7 +1215,7 @@ export default function LockstepApp() {
     }
 
     try {
-      await buildExactPaperBuy({ publicKey: signingKeypair.publicKey.toBase58(), mint: candidate.mint, amountSol: executableBuyAmount, slippagePercent: migrationExecutionSettings.slippage });
+      await buildExactPaperBuy({ publicKey: signingKeypair.publicKey.toBase58(), mint: candidate.mint, amountSol: executableBuyAmount, slippagePercent: migrationExecutionSettings.slippage, priorityFeeSol: migrationExecutionSettings.buyPriorityFeeSol });
     } catch (error) {
       addExecutionActivity(`Paper entry rejected: ${candidate.symbol}`, `${triggerReceipt} · Exact ${executableBuyAmount.toFixed(4)} SOL transaction could not be built by the live trade route · ${error instanceof Error ? error.message : "unknown execution error"} · no fake fill`, "warn", candidate.mint);
       return;
@@ -1226,7 +1230,7 @@ export default function LockstepApp() {
       addExecutionActivity("Paper loss limit reached", "New fake entries disabled; existing paper positions remain protected", "warn");
       return;
     }
-    if (paperCashRef.current < executableBuyAmount + PAPER_PRIORITY_FEE_SOL) {
+    if (paperCashRef.current < executableBuyAmount + migrationExecutionSettings.buyPriorityFeeSol) {
       setEngineMode("paused");
       addExecutionActivity("Paper entry blocked", "Fake SOL balance is too low; reset the paper wallet or reduce order size", "warn");
       return;
@@ -1242,8 +1246,8 @@ export default function LockstepApp() {
         expiresAt: watchDeadline,
       },
     };
-    const nextCash = paperCashRef.current - executableBuyAmount - PAPER_PRIORITY_FEE_SOL;
-    const nextPnl = paperRealizedPnlRef.current - PAPER_PRIORITY_FEE_SOL;
+    const nextCash = paperCashRef.current - executableBuyAmount - migrationExecutionSettings.buyPriorityFeeSol;
+    const nextPnl = paperRealizedPnlRef.current - migrationExecutionSettings.buyPriorityFeeSol;
     const nextPositions = [position, ...paperPositionsRef.current];
     paperCashRef.current = nextCash;
     paperRealizedPnlRef.current = nextPnl;
@@ -1605,7 +1609,7 @@ export default function LockstepApp() {
             <div className="panel-heading"><div><small>STRATEGY</small><h2>{paperMode ? "Migration Paper Lab" : migrationLiveMode ? "Migration Live" : "New Pairs Live"}</h2></div><button className="text-button" onClick={() => setSettingsOpen(true)}>EDIT</button></div>
             <div className="strategy-switch" role="group" aria-label="Trading strategy"><button className={migrationLiveMode ? "selected danger-edge" : ""} onClick={() => changeStrategy("migration-live")}><b>Migration Live</b><small>Real feed · real SOL</small></button><button className={strategyMode === "new-pairs-live" ? "selected danger-edge" : ""} onClick={() => changeStrategy("new-pairs-live")}><b>New Pairs Live</b><small>Real feed · real SOL</small></button><button className={paperMode ? "selected paper-choice" : "paper-choice"} onClick={() => changeStrategy("migration-paper")}><b>Paper Lab</b><small>Fake SOL · isolated</small></button></div>
             <div className="order-size"><span>{paperMode ? "PAPER ORDER SIZE" : "REAL ORDER SIZE"}</span><b>{strategyMode === "new-pairs-live" ? `${newPairsSettings.buyAmount} → ${newPairsSettings.adaptiveBuyAmount}` : `${activeSettings.buyAmount}`} <small>{paperMode ? "FAKE SOL" : "SOL"}</small></b></div>
-            <div className="strategy-rules"><Rule label="Max positions" value={String(activeSettings.maxPositions)} /><Rule label="Daily loss limit" value={`${activeSettings.dailyLoss} ${paperMode ? "fake SOL" : "SOL"}`} danger />{strategyMode !== "new-pairs-live" ? <><Rule label="Entry range" value={`${formatUsdMarketCap(migrationDisplaySettings.boostEntryMinMarketCapUsd)}–${formatUsdMarketCap(migrationDisplaySettings.boostEntryMarketCapUsd)}`} good /><Rule label="Maximum average fill" value={formatUsdMarketCap(migrationDisplaySettings.boostMaximumFillMarketCapUsd)} good /><Rule label={paperMode ? "Exact paper order" : "Exact live order"} value={`${migrationDisplaySettings.buyAmount} ${paperMode ? "fake SOL" : "SOL"}`} danger /><Rule label="Buy slippage" value={`${migrationDisplaySettings.slippage}%`} danger /><Rule label="Sell slippage" value={`${migrationDisplaySettings.exitImpact}%`} danger /><Rule label="Timed sell" value={`${migrationDisplaySettings.boostSellSlicePercent}% remaining every ${migrationDisplaySettings.boostSellIntervalSeconds}s`} /><Rule label="Profit exit" value={`+${migrationDisplaySettings.takeProfit}% · sell all`} good /><Rule label="Five-minute full exit" value={migrationDisplaySettings.boostHardExitEnabled ? "ON" : "OFF · manual exit"} /></> : <><Rule label="Stop loss" value={`−${activeSettings.stopLoss}%`} danger /><Rule label="Quote-up size" value={`${newPairsSettings.adaptiveBuyAmount} SOL`} good /><Rule label="Live impact gate" value={`<${newPairsSettings.maxQuoteImpact}%`} /><Rule label="Take profit" value={`+${activeSettings.takeProfit}%`} good /><Rule label="Maximum hold" value={`${activeSettings.maxHold}s`} /><Rule label="Transaction slippage" value={`${activeSettings.slippage}%`} /></>}</div>
+            <div className="strategy-rules"><Rule label="Max positions" value={String(activeSettings.maxPositions)} /><Rule label="Daily loss limit" value={`${activeSettings.dailyLoss} ${paperMode ? "fake SOL" : "SOL"}`} danger />{strategyMode !== "new-pairs-live" ? <><Rule label="Entry range" value={`${formatUsdMarketCap(migrationDisplaySettings.boostEntryMinMarketCapUsd)}–${formatUsdMarketCap(migrationDisplaySettings.boostEntryMarketCapUsd)}`} good /><Rule label="Maximum average fill" value={formatUsdMarketCap(migrationDisplaySettings.boostMaximumFillMarketCapUsd)} good /><Rule label={paperMode ? "Exact paper order" : "Exact live order"} value={`${migrationDisplaySettings.buyAmount} ${paperMode ? "fake SOL" : "SOL"}`} danger /><Rule label="Buy slippage" value={`${migrationDisplaySettings.slippage}%`} danger /><Rule label="Sell slippage" value={`${migrationDisplaySettings.exitImpact}%`} danger /><Rule label="Buy priority fee" value={`${migrationDisplaySettings.buyPriorityFeeSol} SOL`} danger /><Rule label="Sell priority fee" value={`${migrationDisplaySettings.sellPriorityFeeSol} SOL`} /><Rule label="Timed sell" value={`${migrationDisplaySettings.boostSellSlicePercent}% remaining every ${migrationDisplaySettings.boostSellIntervalSeconds}s`} /><Rule label="Profit exit" value={`+${migrationDisplaySettings.takeProfit}% · sell all`} good /><Rule label="Five-minute full exit" value={migrationDisplaySettings.boostHardExitEnabled ? "ON" : "OFF · manual exit"} /></> : <><Rule label="Stop loss" value={`−${activeSettings.stopLoss}%`} danger /><Rule label="Quote-up size" value={`${newPairsSettings.adaptiveBuyAmount} SOL`} good /><Rule label="Live impact gate" value={`<${newPairsSettings.maxQuoteImpact}%`} /><Rule label="Take profit" value={`+${activeSettings.takeProfit}%`} good /><Rule label="Maximum hold" value={`${activeSettings.maxHold}s`} /><Rule label="Transaction slippage" value={`${activeSettings.slippage}%`} /><Rule label="Buy priority fee" value={`${newPairsSettings.buyPriorityFeeSol} SOL`} danger /><Rule label="Sell priority fee" value={`${newPairsSettings.sellPriorityFeeSol} SOL`} /></>}</div>
             <div className="browser-note"><i>◉</i><span><b>{paperMode ? "Isolated paper execution" : "Browser-bound real execution"}</b><small>{paperMode ? "No code path in this lab can sign or submit a transaction." : "Keep this tab open and wallet unlocked. Live activation is always confirmed separately."}</small></span></div>
             {paperMode && <button className="refresh-button" onClick={resetPaperWallet}>↻ Reset paper wallet to {migrationSettings.paperStartingBalance.toFixed(2)} fake SOL</button>}
           </aside>
@@ -1712,6 +1716,8 @@ function SettingsDrawer({ initialMode, migrationSettings, migrationLiveSettings,
       boostEntryMinMarketCapUsd,
       boostEntryMarketCapUsd,
       boostMaximumFillMarketCapUsd: Math.max(boostEntryMarketCapUsd, value.boostMaximumFillMarketCapUsd),
+      buyPriorityFeeSol: Math.min(0.06, Math.max(0.000001, value.buyPriorityFeeSol)),
+      sellPriorityFeeSol: Math.min(0.06, Math.max(0.000001, value.sellPriorityFeeSol)),
     };
   };
 
@@ -1726,19 +1732,19 @@ function SettingsDrawer({ initialMode, migrationSettings, migrationLiveSettings,
       <div className="settings-mode-note"><i>{paperMode ? "PAPER" : "LIVE"}</i><span><b>{paperMode ? "Migration Paper Lab" : mode === "migration-live" ? "Migration Live" : "New Pairs Live"}</b><small>{paperMode ? "A separate fake-SOL laboratory that cannot sign transactions." : mode === "migration-live" ? "The migration strategy signs real mainnet entries and exits." : "Fresh Pump.fun launches with real wallet execution."}</small></span></div>
       <div className="settings-section"><h3>Entry</h3><div className="settings-grid">
         {field(migrationMode ? paperMode ? "Exact test order" : "Exact live order" : "Base order size", "buyAmount", paperMode ? "FAKE SOL" : "SOL", 0.001)}
-        {migrationMode ? <>{paperMode && field("Paper starting balance", "paperStartingBalance", "FAKE SOL", 0.1)}<NumberField label="Entry minimum" suffix="USD MC" value={migrationModeDraft.boostEntryMinMarketCapUsd} step={100} onChange={(value) => setMigrationValue("boostEntryMinMarketCapUsd", value)} /><NumberField label="Entry maximum" suffix="USD MC" value={migrationModeDraft.boostEntryMarketCapUsd} step={100} onChange={(value) => setMigrationValue("boostEntryMarketCapUsd", value)} /><NumberField label="Maximum average fill" suffix="USD MC" value={migrationModeDraft.boostMaximumFillMarketCapUsd} step={100} onChange={(value) => setMigrationValue("boostMaximumFillMarketCapUsd", value)} />{field("Buy slippage", "slippage", "%", 0.1)}<NumberField label="Sell slippage" suffix="%" value={migrationModeDraft.exitImpact} step={0.1} onChange={(value) => setMigrationValue("exitImpact", value)} /></> : <>{field("Quote-up order size", "adaptiveBuyAmount", "SOL", 0.01)}{field("Maximum live impact", "maxQuoteImpact", "%", 0.1)}{field("Transaction slippage", "slippage", "%", 0.1)}</>}
+        {migrationMode ? <>{paperMode && field("Paper starting balance", "paperStartingBalance", "FAKE SOL", 0.1)}<NumberField label="Entry minimum" suffix="USD MC" value={migrationModeDraft.boostEntryMinMarketCapUsd} step={100} onChange={(value) => setMigrationValue("boostEntryMinMarketCapUsd", value)} /><NumberField label="Entry maximum" suffix="USD MC" value={migrationModeDraft.boostEntryMarketCapUsd} step={100} onChange={(value) => setMigrationValue("boostEntryMarketCapUsd", value)} /><NumberField label="Maximum average fill" suffix="USD MC" value={migrationModeDraft.boostMaximumFillMarketCapUsd} step={100} onChange={(value) => setMigrationValue("boostMaximumFillMarketCapUsd", value)} />{field("Buy slippage", "slippage", "%", 0.1)}<NumberField label="Sell slippage" suffix="%" value={migrationModeDraft.exitImpact} step={0.1} onChange={(value) => setMigrationValue("exitImpact", value)} /><NumberField label="Buy priority fee" suffix="SOL / TX" value={migrationModeDraft.buyPriorityFeeSol} step={0.001} max={0.06} onChange={(value) => setMigrationValue("buyPriorityFeeSol", value)} /><NumberField label="Sell priority fee" suffix="SOL / TX" value={migrationModeDraft.sellPriorityFeeSol} step={0.001} max={0.06} onChange={(value) => setMigrationValue("sellPriorityFeeSol", value)} /></> : <>{field("Quote-up order size", "adaptiveBuyAmount", "SOL", 0.01)}{field("Maximum live impact", "maxQuoteImpact", "%", 0.1)}{field("Transaction slippage", "slippage", "%", 0.1)}<NumberField label="Buy priority fee" suffix="SOL / TX" value={newPairsDraft.buyPriorityFeeSol} step={0.001} max={0.06} onChange={(value) => set("buyPriorityFeeSol", value)} /><NumberField label="Sell priority fee" suffix="SOL / TX" value={newPairsDraft.sellPriorityFeeSol} step={0.001} max={0.06} onChange={(value) => set("sellPriorityFeeSol", value)} /></>}
         {field("Maximum positions", "maxPositions", undefined, 1)}
       </div></div>
       {migrationMode && <div className="settings-section"><h3>Timed exit</h3><div className="settings-grid"><NumberField label="Sell each interval" suffix="% REMAINING" value={migrationModeDraft.boostSellSlicePercent} step={1} onChange={(value) => setMigrationValue("boostSellSlicePercent", value)} /><NumberField label="Sell interval" suffix="SEC" value={migrationModeDraft.boostSellIntervalSeconds} step={1} onChange={(value) => setMigrationValue("boostSellIntervalSeconds", value)} />{field("Instant full exit", "takeProfit", "% PROFIT", 10)}<ToggleField label="Full exit after five minutes" checked={migrationModeDraft.boostHardExitEnabled} onChange={setHardExitEnabled} /></div></div>}
       <div className="settings-section"><h3>Protection</h3><div className="settings-grid">{field("Daily loss limit", "dailyLoss", paperMode ? "FAKE SOL" : "SOL", 0.001)}{mode === "new-pairs-live" && <>{field("Stop loss", "stopLoss", "%", 0.1)}{field("Take profit", "takeProfit", "%", 1)}{field("Maximum hold", "maxHold", "SEC", 1)}</>}</div></div>
       <div className={`drawer-warning ${paperMode ? "paper" : ""}`}>{paperMode ? "This isolated lab uses live market data and fake SOL only. It cannot sign or submit a wallet transaction." : mode === "migration-live" ? `Migration Live submits the exact configured SOL order to mainnet, then sells the configured percentage of remaining tokens each interval. It has no stop loss and ${migrationModeDraft.boostHardExitEnabled ? "attempts a full exit at the profit target or five-minute deadline" : "leaves anything remaining after five minutes for manual exit"}. Transactions can fail, and the entire amount can be lost.` : "Lockstep quotes the larger order first, falls back to the base amount when needed, and skips the trade if the fresh quote is missing, older than two seconds, or at/above the impact limit."}</div>
-      <div className="drawer-actions"><button className="secondary-button" onClick={onClose}>Cancel</button><button className="primary-button" onClick={() => onSave(normalizedMigration(migrationDraft), { ...normalizedMigration(migrationLiveDraft), paperStartingBalance: 0 }, { ...newPairsDraft, adaptiveBuyAmount: Math.max(newPairsDraft.buyAmount, newPairsDraft.adaptiveBuyAmount) })}>Save all strategies</button></div>
+      <div className="drawer-actions"><button className="secondary-button" onClick={onClose}>Cancel</button><button className="primary-button" onClick={() => onSave(normalizedMigration(migrationDraft), { ...normalizedMigration(migrationLiveDraft), paperStartingBalance: 0 }, { ...newPairsDraft, adaptiveBuyAmount: Math.max(newPairsDraft.buyAmount, newPairsDraft.adaptiveBuyAmount), buyPriorityFeeSol: Math.min(0.06, Math.max(0.000001, newPairsDraft.buyPriorityFeeSol)), sellPriorityFeeSol: Math.min(0.06, Math.max(0.000001, newPairsDraft.sellPriorityFeeSol)) })}>Save all strategies</button></div>
     </aside>
   </div>;
 }
 
-function NumberField({ label, suffix, value, step, onChange }: { label: string; suffix?: string; value: number; step: number; onChange: (value: number) => void }) {
-  return <label className="number-field"><span>{label}{suffix && <em>{suffix}</em>}</span><input type="number" min={step} step={step} value={value} onChange={(event) => onChange(Number(event.target.value))} /></label>;
+function NumberField({ label, suffix, value, step, max, onChange }: { label: string; suffix?: string; value: number; step: number; max?: number; onChange: (value: number) => void }) {
+  return <label className="number-field"><span>{label}{suffix && <em>{suffix}</em>}</span><input type="number" min={step} max={max} step={step} value={value} onChange={(event) => onChange(Number(event.target.value))} /></label>;
 }
 
 function ToggleField({ label, checked, onChange }: { label: string; checked: boolean; onChange: (value: boolean) => void }) {

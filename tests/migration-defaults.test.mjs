@@ -20,6 +20,8 @@ test("Migration Paper starts from its confirmed defaults instead of legacy setti
   assert.match(source, /boostEntryMarketCapUsd:\s*3500,/);
   assert.match(source, /boostMaximumFillMarketCapUsd:\s*4700,/);
   assert.match(source, /boostHardExitEnabled:\s*true,/);
+  assert.match(source, /buyPriorityFeeSol:\s*0\.01,/);
+  assert.match(source, /sellPriorityFeeSol:\s*0\.001,/);
   assert.match(source, /lockstep\.settings\.migration\.v14/);
   assert.match(source, /lockstep\.settings\.migration-live\.v2/);
   assert.match(source, /useState\(migrationDefaults\.paperStartingBalance\)/);
@@ -258,8 +260,13 @@ test("Live priority fee lookup is warmed outside the buy path", async () => {
   assert.match(tradingSource, /DEFAULT_PRIORITY_FEE_SOL = 0\.01/);
   assert.match(tradingSource, /MIN_LIVE_PRIORITY_FEE_SOL = 0\.01/);
   assert.match(tradingSource, /MAX_LIVE_PRIORITY_FEE_SOL = 0\.06/);
-  assert.match(source, /PAPER_PRIORITY_FEE_SOL = 0\.01/);
   assert.match(tradingSource, /getCachedCompetitivePriorityFeeSol\(\)/);
+  assert.match(tradingSource, /priorityFeeSol\?: number/);
+  assert.match(tradingSource, /activePriorityFeeSol/);
+  assert.match(source, /priorityFeeSol:\s*migrationExecutionSettings\.buyPriorityFeeSol/);
+  assert.match(source, /priorityFeeSol:\s*migrationLiveSettings\.sellPriorityFeeSol/);
+  assert.match(source, /label="Buy priority fee"/);
+  assert.match(source, /label="Sell priority fee"/);
   assert.match(tradingSource, /export function warmLiveTradePreparation/);
   assert.doesNotMatch(tradingSource, /priorityFeeSol = await fetchCompetitivePriorityFeeSol/);
   assert.match(source, /if \(unlocked\) warmLiveTradePreparation\(\)/);
