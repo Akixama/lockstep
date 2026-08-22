@@ -113,6 +113,15 @@ button { color: inherit; }
 .revealed-key { display: grid; grid-template-columns: 1fr auto; }.revealed-key input { min-width: 0; border-radius: 8px 0 0 8px; font-family: var(--font-geist-mono); }.revealed-key button { border: 1px solid #303933; border-left: 0; border-radius: 0 8px 8px 0; padding: 0 14px; background: #111812; color: var(--acid); cursor: pointer; font-size: 9px; }
 .private-key-actions { display: grid; grid-template-columns: 1.4fr 1fr; gap: 9px; margin-top: 12px; }.key-expiry { margin-bottom: 0; color: #8e7779!important; font-size: 8px!important; }
 
+.toggle-field { display: flex; flex-direction: column; gap: 8px; color: #838c85; font-size: 9px; }
+.toggle-field button { min-height: 43px; border: 1px solid #29322b; border-radius: 9px; padding: 8px 11px; background: #090d0a; color: #69726b; display: flex; align-items: center; gap: 9px; cursor: pointer; }
+.toggle-field button i { width: 28px; height: 16px; border-radius: 999px; background: #252c27; position: relative; transition: background .18s; }
+.toggle-field button i::after { content: ""; position: absolute; width: 10px; height: 10px; border-radius: 50%; top: 3px; left: 3px; background: #7a837c; transition: transform .18s, background .18s; }
+.toggle-field button.on { border-color: #71813b; color: var(--acid); }
+.toggle-field button.on i { background: rgba(216,255,79,.28); }
+.toggle-field button.on i::after { transform: translateX(12px); background: var(--acid); }
+.toggle-field button b { font-size: 9px; }
+
 @media (max-width: 980px) {
   .onboarding-grid { grid-template-columns: 1fr; gap: 45px; padding-top: 45px; }.onboarding-copy { text-align: center; margin: auto; }.onboarding-copy > p { margin-inline: auto; }.trust-strip { justify-content: center; flex-wrap: wrap; }.onboarding-card { width: min(520px, 100%); margin: auto; }.main-grid { grid-template-columns: 1fr; }.metric-grid { grid-template-columns: 1fr 1fr; }.engine-bar { align-items: flex-start; gap: 20px; }.mode-tabs button { min-width: 0; }
 }

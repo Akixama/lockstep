@@ -19,6 +19,7 @@ test("Migration Paper starts from its confirmed defaults instead of legacy setti
   assert.match(source, /boostEntryMinMarketCapUsd:\s*1600,/);
   assert.match(source, /boostEntryMarketCapUsd:\s*3500,/);
   assert.match(source, /boostMaximumFillMarketCapUsd:\s*4700,/);
+  assert.match(source, /boostHardExitEnabled:\s*true,/);
   assert.match(source, /lockstep\.settings\.migration\.v14/);
   assert.match(source, /lockstep\.settings\.migration-live\.v2/);
   assert.match(source, /useState\(migrationDefaults\.paperStartingBalance\)/);
@@ -36,6 +37,10 @@ test("Migration Paper starts from its confirmed defaults instead of legacy setti
   assert.doesNotMatch(source, /PUMPPORTAL_API_KEY/);
   assert.match(source, /nextSliceAt: completedAt \+ current\.paperExitPlan\.intervalSeconds \* 1000/);
   assert.match(source, /nextSliceAt: attemptedAt \+ 2_000/);
+  assert.match(source, /if \(migrationLiveSettings\.boostHardExitEnabled\) void closeLivePosition/);
+  assert.match(source, /if \(migrationSettings\.boostHardExitEnabled\) closePaperPosition/);
+  assert.match(source, /role="switch"/);
+  assert.match(source, /Full exit after five minutes/);
   assert.doesNotMatch(source, /nextSliceAt: current\.paperExitPlan\.nextSliceAt \+ current\.paperExitPlan\.intervalSeconds \* 1000/);
 });
 
