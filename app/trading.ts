@@ -78,7 +78,8 @@ export type PaperBuyBuild = { transactionBytes: number };
 type PumpSwapEntryGuard = {
   reportedMarketCapUsd?: number;
   minimumMarketCapUsd: number;
-  maximumMarketCapUsd: number;
+  maximumEntryMarketCapUsd: number;
+  maximumFillMarketCapUsd: number;
   solUsdPrice: number;
 };
 
@@ -277,12 +278,12 @@ async function buildLocalPumpSwapBuyTransaction({ keypair, mint, amountSol, slip
     verifiedMarketCapUsd = verifiedSpotPriceSol * totalSupplyTokens * entryGuard.solUsdPrice;
     if (!Number.isFinite(verifiedMarketCapUsd)
       || verifiedMarketCapUsd < entryGuard.minimumMarketCapUsd
-      || verifiedMarketCapUsd > entryGuard.maximumMarketCapUsd) {
+      || verifiedMarketCapUsd > entryGuard.maximumEntryMarketCapUsd) {
       const reported = Number.isFinite(entryGuard.reportedMarketCapUsd)
         ? ` (PumpPortal reported $${Number(entryGuard.reportedMarketCapUsd).toFixed(0)})`
         : "";
       throw new LiveTradeEntryGuardError(
-        `Verified on-chain MC $${Number.isFinite(verifiedMarketCapUsd) ? verifiedMarketCapUsd.toFixed(0) : "unavailable"}${reported} was outside the $${entryGuard.minimumMarketCapUsd.toFixed(0)}–$${entryGuard.maximumMarketCapUsd.toFixed(0)} strategy range`,
+        `Verified on-chain MC $${Number.isFinite(verifiedMarketCapUsd) ? verifiedMarketCapUsd.toFixed(0) : "unavailable"}${reported} was outside the $${entryGuard.minimumMarketCapUsd.toFixed(0)}–$${entryGuard.maximumEntryMarketCapUsd.toFixed(0)} entry range`,
       );
     }
   }
@@ -306,12 +307,12 @@ async function buildLocalPumpSwapBuyTransaction({ keypair, mint, amountSol, slip
     const projectedImpactPercent = (projectedFillMarketCapUsd / verifiedMarketCapUsd - 1) * 100;
     if (!Number.isFinite(projectedFillMarketCapUsd)
       || !Number.isFinite(projectedImpactPercent)
-      || projectedFillMarketCapUsd > entryGuard.maximumMarketCapUsd) {
+      || projectedFillMarketCapUsd > entryGuard.maximumFillMarketCapUsd) {
       throw new LiveTradeEntryGuardError(
-        `Projected average fill $${projectedFillMarketCapUsd.toFixed(0)} MC · ${Math.max(0, projectedImpactPercent).toFixed(1)}% above trigger exceeds the $${entryGuard.maximumMarketCapUsd.toFixed(0)} MC strategy maximum`,
+        `Projected average fill $${projectedFillMarketCapUsd.toFixed(0)} MC · ${Math.max(0, projectedImpactPercent).toFixed(1)}% above verified spot exceeds the $${entryGuard.maximumFillMarketCapUsd.toFixed(0)} MC fill maximum`,
       );
     }
-    const minimumTokensOut = amountSol * totalSupplyTokens * entryGuard.solUsdPrice / entryGuard.maximumMarketCapUsd;
+    const minimumTokensOut = amountSol * totalSupplyTokens * entryGuard.solUsdPrice / entryGuard.maximumFillMarketCapUsd;
     const minimumRawBaseAmountOut = Math.ceil(minimumTokensOut * baseUnitScale);
     if (!Number.isSafeInteger(minimumRawBaseAmountOut) || minimumRawBaseAmountOut <= 0) {
       throw new LiveTradeEntryGuardError("Entry protection could not calculate the strategy's maximum confirmed fill");
