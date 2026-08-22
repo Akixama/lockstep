@@ -126,7 +126,9 @@ class ProcessedPumpSwapSignals {
       }));
     });
     socket.addEventListener("message", (event) => this.handleMessage(event));
-    socket.addEventListener("error", () => socket.close());
+    socket.addEventListener("error", () => {
+      // A failed WebSocket emits close next; that handler schedules the reconnect.
+    });
     socket.addEventListener("close", () => {
       if (this.socket !== socket) return;
       this.socket = null;
@@ -270,7 +272,9 @@ class PumpPortalRelay {
       this.listeners.forEach((_listeners, mint) => this.send({ method: "subscribeTokenTrade", keys: [mint] }));
     });
     socket.addEventListener("message", (event) => this.handleMessage(event));
-    socket.addEventListener("error", () => socket.close());
+    socket.addEventListener("error", () => {
+      // A failed WebSocket emits close next; that handler schedules the reconnect.
+    });
     socket.addEventListener("close", () => {
       if (this.socket !== socket) return;
       this.socket = null;
