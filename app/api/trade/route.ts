@@ -2,6 +2,17 @@ import { NextRequest, NextResponse } from "next/server";
 
 const TRADE_URL = "https://pumpportal.fun/api/trade-local";
 
+export async function GET() {
+  try {
+    // Keep the server route and PumpPortal DNS/TLS path warm without building,
+    // signing, submitting, or charging for a transaction.
+    await fetch(TRADE_URL, { method: "OPTIONS", cache: "no-store" });
+  } catch {
+    // A real sell can still open the connection normally.
+  }
+  return new NextResponse(null, { status: 204 });
+}
+
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json() as Record<string, unknown>;

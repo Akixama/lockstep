@@ -182,6 +182,7 @@ test("Fresh per-token trades trigger immediately and USD market cap falls back t
   assert.match(source, /warmPumpSwapSell\(livePosition\.mint, signingKeypair\.publicKey\)/);
   assert.match(source, /setInterval\(warmOpenMigrationExits, 10_000\)/);
   assert.match(tradingSource, /export function warmPumpSwapSell/);
+  assert.match(tradingSource, /fetch\("\/api\/trade", \{ method: "GET", cache: "no-store" \}\)/);
   assert.match(source, /streamedMark\.symbol === "MIG" \? candidate\.symbol/);
   assert.match(tradingSource, /buildLocalPumpSwapBuyTransaction/);
   assert.match(tradingSource, /prepareRecentBlockhash/);

@@ -137,6 +137,7 @@ let pumpSwapModulePromise: Promise<typeof import("@pump-fun/pump-swap-sdk")> | n
 const preparedPumpSwapStates = new Map<string, Promise<{ state: SwapSolanaState; preparedAt: number }>>();
 let preparedRecentBlockhash: { blockhash: string; preparedAt: number } | null = null;
 let recentBlockhashPreparation: Promise<{ blockhash: string; preparedAt: number }> | null = null;
+let remoteSellBuilderWarmExpiresAt = 0;
 
 async function fetchCompetitivePriorityFeeSol(): Promise<number> {
   try {
@@ -251,6 +252,12 @@ export function warmPumpSwapSell(mint: string, user: PublicKey) {
   void prepareRecentBlockhash().catch(() => {
     // Warming is speculative and must never block position management.
   });
+  if (Date.now() >= remoteSellBuilderWarmExpiresAt) {
+    remoteSellBuilderWarmExpiresAt = Date.now() + 30_000;
+    void fetch("/api/trade", { method: "GET", cache: "no-store" }).catch(() => {
+      // A later real sell can still start the route normally.
+    });
+  }
 }
 
 async function buildLocalPumpSwapBuyTransaction({ keypair, mint, amountSol, slippagePercent, priorityFeeSol, entryGuard }: {
