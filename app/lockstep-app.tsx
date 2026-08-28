@@ -9,7 +9,7 @@ import { gcm } from "@noble/ciphers/aes";
 import { pbkdf2Async } from "@noble/hashes/pbkdf2";
 import { sha256 } from "@noble/hashes/sha256";
 import { utf8ToBytes } from "@noble/hashes/utils";
-import { buildExactPaperBuy, buildSignAndSendTrade, describeLiveTradeFailure, fetchLiveBuyQuote, fetchPumpPrice, formatLiveExecutionDiagnostics, isRetryableLiveTradeFailure, LiveTradeEntryGuardError, openLaunchFeed, openMigrationFeed, verifyMigrationCandidate, warmLiveTradePreparation, warmPumpSwapBuy, type LaunchCandidate, type LivePosition, type TokenTradeWatcher } from "./trading";
+import { buildExactPaperBuy, buildSignAndSendTrade, describeLiveTradeFailure, fetchLiveBuyQuote, fetchPumpPrice, formatLiveExecutionDiagnostics, isRetryableLiveTradeFailure, LiveTradeEntryGuardError, openLaunchFeed, openMigrationFeed, verifyMigrationCandidate, warmLiveTradePreparation, warmPumpSwapBuy, warmPumpSwapSell, type LaunchCandidate, type LivePosition, type TokenTradeWatcher } from "./trading";
 
 type StoredWallet = {
   version: 1;
@@ -431,6 +431,19 @@ export default function LockstepApp() {
   useEffect(() => {
     if (unlocked) warmLiveTradePreparation();
   }, [unlocked]);
+  useEffect(() => {
+    if (!unlocked || !keypairRef.current || positions.length === 0) return;
+    const warmOpenMigrationExits = () => {
+      const user = keypairRef.current?.publicKey;
+      if (!user) return;
+      for (const position of positionsRef.current) {
+        if (position.status === "open" && position.source === "migration") warmPumpSwapSell(position.mint, user);
+      }
+    };
+    warmOpenMigrationExits();
+    const timer = window.setInterval(warmOpenMigrationExits, 10_000);
+    return () => window.clearInterval(timer);
+  }, [positions.length, unlocked]);
   useEffect(() => { paperCashRef.current = paperCash; }, [paperCash]);
   useEffect(() => { paperRealizedPnlRef.current = paperRealizedPnl; }, [paperRealizedPnl]);
   useEffect(() => { if (hydrated) localStorage.setItem(POSITIONS_KEY, JSON.stringify(positions)); }, [hydrated, positions]);
@@ -1194,6 +1207,7 @@ export default function LockstepApp() {
             expiresAt: watchDeadline,
           },
         };
+        warmPumpSwapSell(livePosition.mint, signingKeypair.publicKey);
         setPositions((current) => [livePosition, ...current]);
         migrationEntryFailureStreak.current = 0;
         addExecutionActivity(`Live bought ${livePosition.symbol}`, `${triggerReceipt} · confirmed fill ${formatUsdMarketCap(livePosition.entryMarketCapUsd)}${confirmedFill ? ` from ${confirmedFill.tokensReceived.toFixed(2)} tokens` : " · fill details unavailable"} · ${signature.slice(0, 8)}… · ${Math.max(0, Math.round((Date.now() - migrationStartedAt) / 1000))}s after migration${executionDetail ? ` · ${executionDetail}` : ""}`, "good", livePosition.mint);

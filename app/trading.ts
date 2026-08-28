@@ -243,6 +243,16 @@ export function warmPumpSwapBuy(mint: string, user: PublicKey) {
   });
 }
 
+/** Keep PumpSwap exit prerequisites hot while a live position is open. */
+export function warmPumpSwapSell(mint: string, user: PublicKey) {
+  void preparePumpSwapState(mint, user).catch(() => {
+    // The execution path refreshes anything that could not be prepared here.
+  });
+  void prepareRecentBlockhash().catch(() => {
+    // Warming is speculative and must never block position management.
+  });
+}
+
 async function buildLocalPumpSwapBuyTransaction({ keypair, mint, amountSol, slippagePercent, priorityFeeSol, entryGuard }: {
   keypair: Keypair;
   mint: string;
@@ -380,6 +390,7 @@ async function buildLocalPumpSwapBuyTransaction({ keypair, mint, amountSol, slip
   }
   return transaction;
 }
+
 // ---------------------------------------------------------------------------
 
 function ceilDiv(value: bigint, divisor: bigint) {
