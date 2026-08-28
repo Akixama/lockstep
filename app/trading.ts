@@ -78,7 +78,7 @@ export type PaperBuyBuild = { transactionBytes: number };
 type PumpSwapEntryGuard = {
   reportedMarketCapUsd?: number;
   minimumMarketCapUsd: number;
-  maximumEntryMarketCapUsd: number;
+  maximumSpotMarketCapUsd: number;
   maximumFillMarketCapUsd: number;
   solUsdPrice: number;
   latestSubmitAt?: number;
@@ -320,12 +320,12 @@ async function buildLocalPumpSwapBuyTransaction({ keypair, mint, amountSol, slip
     verifiedMarketCapUsd = verifiedSpotPriceSol * totalSupplyTokens * entryGuard.solUsdPrice;
     if (!Number.isFinite(verifiedMarketCapUsd)
       || verifiedMarketCapUsd < entryGuard.minimumMarketCapUsd
-      || verifiedMarketCapUsd > entryGuard.maximumEntryMarketCapUsd) {
+      || verifiedMarketCapUsd > entryGuard.maximumSpotMarketCapUsd) {
       const reported = Number.isFinite(entryGuard.reportedMarketCapUsd)
         ? ` (PumpPortal reported $${Number(entryGuard.reportedMarketCapUsd).toFixed(0)})`
         : "";
       throw new LiveTradeEntryGuardError(
-        `Verified on-chain MC $${Number.isFinite(verifiedMarketCapUsd) ? verifiedMarketCapUsd.toFixed(0) : "unavailable"}${reported} was outside the $${entryGuard.minimumMarketCapUsd.toFixed(0)}–$${entryGuard.maximumEntryMarketCapUsd.toFixed(0)} entry range`,
+        `Verified on-chain MC $${Number.isFinite(verifiedMarketCapUsd) ? verifiedMarketCapUsd.toFixed(0) : "unavailable"}${reported} was outside the $${entryGuard.minimumMarketCapUsd.toFixed(0)}–$${entryGuard.maximumSpotMarketCapUsd.toFixed(0)} executable range`,
       );
     }
   }
