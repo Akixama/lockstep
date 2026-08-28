@@ -124,6 +124,7 @@ const MAX_LIVE_PRIORITY_FEE_SOL = 0.06; // user-approved hard cap for highly com
 const ESTIMATED_COMPUTE_UNITS = 300_000;
 const PRIORITY_FEE_CACHE_MS = 15_000;
 const PUMP_SWAP_PREPARATION_TTL_MS = 5 * 60_000;
+const RECENT_BLOCKHASH_PREPARATION_TTL_MS = 15_000;
 const MAX_PREPARED_PUMP_SWAP_POOLS = 64;
 const TRADE_STREAM_FAILURE_GRACE_MS = 5_000;
 
@@ -134,6 +135,8 @@ let pumpSwapConnection: Connection | null = null;
 let pumpSwapOnlineSdk: OnlinePumpAmmSdk | null = null;
 let pumpSwapModulePromise: Promise<typeof import("@pump-fun/pump-swap-sdk")> | null = null;
 const preparedPumpSwapStates = new Map<string, Promise<{ state: SwapSolanaState; preparedAt: number }>>();
+let preparedRecentBlockhash: { blockhash: string; preparedAt: number } | null = null;
+let recentBlockhashPreparation: Promise<{ blockhash: string; preparedAt: number }> | null = null;
 
 async function fetchCompetitivePriorityFeeSol(): Promise<number> {
   try {
@@ -212,10 +215,31 @@ function preparePumpSwapState(mint: string, user: PublicKey) {
   return preparation;
 }
 
+function prepareRecentBlockhash() {
+  if (preparedRecentBlockhash && Date.now() - preparedRecentBlockhash.preparedAt <= RECENT_BLOCKHASH_PREPARATION_TTL_MS) {
+    return Promise.resolve(preparedRecentBlockhash);
+  }
+  if (recentBlockhashPreparation) return recentBlockhashPreparation;
+  recentBlockhashPreparation = (rpc("getLatestBlockhash", [{ commitment: "processed" }]) as Promise<{ value?: { blockhash?: string } }>)
+    .then((result) => {
+      const blockhash = result.value?.blockhash;
+      if (!blockhash) throw new Error("A fresh Solana blockhash was unavailable");
+      preparedRecentBlockhash = { blockhash, preparedAt: Date.now() };
+      return preparedRecentBlockhash;
+    })
+    .finally(() => {
+      recentBlockhashPreparation = null;
+    });
+  return recentBlockhashPreparation;
+}
+
 /** Begin fetching immutable PumpSwap accounts while the token is only being watched. */
 export function warmPumpSwapBuy(mint: string, user: PublicKey) {
   void preparePumpSwapState(mint, user).catch(() => {
     // A just-created pool may not be indexed yet. The execution path retries.
+  });
+  void prepareRecentBlockhash().catch(() => {
+    // Execution requests a fresh blockhash if this speculative warmup fails.
   });
 }
 
@@ -244,12 +268,11 @@ async function buildLocalPumpSwapBuyTransaction({ keypair, mint, amountSol, slip
   ];
   const [accountInfos, blockhashResult] = await Promise.all([
     connection.getMultipleAccountsInfo(accountKeys, "processed"),
-    rpc("getLatestBlockhash", [{ commitment: "processed" }]) as Promise<{ value?: { blockhash?: string } }>,
+    prepareRecentBlockhash(),
   ]);
   const [poolAccountInfo, poolBaseAccountInfo, poolQuoteAccountInfo, userBaseAccountInfo, userQuoteAccountInfo] = accountInfos;
   if (!poolAccountInfo || !poolBaseAccountInfo || !poolQuoteAccountInfo) throw new Error("Fresh PumpSwap pool accounts were unavailable");
-  const blockhash = blockhashResult.value?.blockhash;
-  if (!blockhash) throw new Error("A fresh Solana blockhash was unavailable");
+  const blockhash = blockhashResult.blockhash;
   const pool = pumpSwapModule.PUMP_AMM_SDK.decodePool(poolAccountInfo);
   const poolBaseAmount = new BN(AccountLayout.decode(poolBaseAccountInfo.data).amount.toString());
   const poolQuoteAmount = new BN(AccountLayout.decode(poolQuoteAccountInfo.data).amount.toString());

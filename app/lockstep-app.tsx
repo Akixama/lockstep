@@ -70,6 +70,7 @@ const migrationDefaults = {
   boostEntryMinMarketCapUsd: 1600,
   boostEntryMarketCapUsd: 3500,
   boostMaximumFillMarketCapUsd: 4700,
+  boostReboundPercent: 6,
   boostMinimumRemainingSeconds: 60,
   boostSellSlicePercent: 10,
   boostSellIntervalSeconds: 12,
@@ -826,11 +827,11 @@ export default function LockstepApp() {
     const stopTradeWatch = watchTokenTrades?.(
       unverifiedCandidate.mint,
       (mark) => {
-        // Only the newest streamed price is useful for a fast-moving token.
-        // Retaining older frames can make execution act on a market cap that
-        // has already been replaced by several newer trades.
-        streamedMarks.length = 0;
+        // Rebound detection needs the trade order so a short-lived low is not
+        // overwritten by the next frame before the watch loop sees it. Keep a
+        // small bounded queue; the loop drains it synchronously without HTTP.
         streamedMarks.push(mark);
+        if (streamedMarks.length > 64) streamedMarks.splice(0, streamedMarks.length - 64);
         wakeStreamWait?.();
       },
       (status) => {
@@ -908,7 +909,8 @@ export default function LockstepApp() {
     const minimumBoostRemainingSeconds = Math.min(MIGRATION_WINDOW_SECONDS - 1, Math.max(0, migrationExecutionSettings.boostMinimumRemainingSeconds));
     const entryDeadline = watchDeadline - minimumBoostRemainingSeconds * 1000;
     const rugTriggerLabel = `${formatUsdMarketCap(migrationExecutionSettings.boostEntryMinMarketCapUsd)}–${formatUsdMarketCap(migrationExecutionSettings.boostEntryMarketCapUsd)}`;
-    addExecutionActivity(`${candidate.symbol} BOOST watch`, `${watchTokenTrades ? "Processed WebSocket + shared trade stream + backup polling" : "Backup polling"} for up to ${Math.max(0, Math.ceil((entryDeadline - Date.now()) / 1000))}s · buying stops with ${minimumBoostRemainingSeconds}s of BOOST remaining · waiting for the coin to enter ${rugTriggerLabel}`, "neutral", candidate.mint);
+    const requiredReboundPercent = Math.min(100, Math.max(0, migrationExecutionSettings.boostReboundPercent));
+    addExecutionActivity(`${candidate.symbol} BOOST watch`, `${watchTokenTrades ? "Processed WebSocket + shared trade stream + backup polling" : "Backup polling"} for up to ${Math.max(0, Math.ceil((entryDeadline - Date.now()) / 1000))}s · buying stops with ${minimumBoostRemainingSeconds}s of BOOST remaining · tracking the live low, then buying the first ${requiredReboundPercent.toFixed(1)}% rebound inside ${rugTriggerLabel}`, "neutral", candidate.mint);
     // LOGGING: every price check this watch performs (stream-confirm or
     // direct poll, success or failure) is now written to console so a
     // watch's full price history is searchable in Vercel's function logs by
@@ -917,21 +919,33 @@ export default function LockstepApp() {
     // "genuinely never entered range" apart from "fetchPumpPrice kept
     // failing/never got called" after the fact.
     let triggerCandidate: LaunchCandidate | null = null;
-    // FIX: previously this required an observed price above the range's upper
-    // bound (a "spike then fall back") before an entry inside the range would
-    // trigger — see hasObservedAboveEntryBand in the prior version. That meant
-    // a coin (or a large buy) that rose gradually and settled inside the
-    // configured MC range without ever spiking above it would never trigger
-    // an entry, no matter how much SOL landed on it. Entry now fires on any
-    // observed mark inside [boostEntryMinMarketCapUsd, boostEntryMarketCapUsd],
-    // spike or no spike.
+    let lowestObservedMarketCapUsd = Number.POSITIVE_INFINITY;
+    let lowestObservedAt = 0;
+    let triggerLowMarketCapUsd = Number.NaN;
+    let triggerReboundPercent = Number.NaN;
+    const reachesDipRebound = (marketCapUsd: number, observedAt?: number) => {
+      // Observe prices below the entry floor too, but never submit until the
+      // rebound itself is back inside the configured entry range. This catches
+      // a real low below $1.6K without weakening the user's entry protection.
+      if (!Number.isFinite(marketCapUsd) || marketCapUsd <= 0 || marketCapUsd > migrationExecutionSettings.boostEntryMarketCapUsd) return false;
+      if (marketCapUsd < lowestObservedMarketCapUsd) {
+        lowestObservedMarketCapUsd = marketCapUsd;
+        lowestObservedAt = Number(observedAt ?? Date.now());
+        return false;
+      }
+      const reboundPercent = (marketCapUsd / lowestObservedMarketCapUsd - 1) * 100;
+      const insideEntryRange = marketCapUsd >= migrationExecutionSettings.boostEntryMinMarketCapUsd
+        && marketCapUsd <= migrationExecutionSettings.boostEntryMarketCapUsd;
+      if (!insideEntryRange || marketCapUsd <= lowestObservedMarketCapUsd || reboundPercent < requiredReboundPercent) return false;
+      triggerLowMarketCapUsd = lowestObservedMarketCapUsd;
+      triggerReboundPercent = reboundPercent;
+      return true;
+    };
     while (Date.now() < entryDeadline && engineModeRef.current === "active" && strategyModeRef.current === migrationMode) {
-      const streamedMark = streamedMarks.pop();
+      const streamedMark = streamedMarks.shift();
       if (streamedMark) {
         const streamedMarketCapUsd = marketCapUsdFor(streamedMark, solUsdPrice);
-        const crossedRugTrigger = Number.isFinite(streamedMarketCapUsd)
-          && streamedMarketCapUsd >= migrationExecutionSettings.boostEntryMinMarketCapUsd
-          && streamedMarketCapUsd <= migrationExecutionSettings.boostEntryMarketCapUsd;
+        const crossedRugTrigger = reachesDipRebound(streamedMarketCapUsd, streamedMark.observedAt);
         // The migration was already verified before this watch began. A fresh
         // per-token trade is therefore the lowest-latency price source and must
         // be allowed to trigger directly; waiting for an HTTP confirmation can
@@ -944,7 +958,7 @@ export default function LockstepApp() {
             name: streamedMark.name === "Migrated token" ? candidate.name : streamedMark.name,
             marketCapUsd: streamedMarketCapUsd,
           };
-          console.log(`[BOOST watch] ${candidate.mint} (${candidate.symbol}) live-trade trigger: mc=${streamedMarketCapUsd} t=${new Date().toISOString()}`);
+          console.log(`[BOOST watch] ${candidate.mint} (${candidate.symbol}) live-trade rebound trigger: low=${triggerLowMarketCapUsd} mc=${streamedMarketCapUsd} rebound=${triggerReboundPercent}% t=${new Date().toISOString()}`);
           break;
         }
         continue;
@@ -969,11 +983,8 @@ export default function LockstepApp() {
           && Boolean(mark.poolAddress)
           && !mark.isMayhemMode
           && mark.isStandardPumpfunMigration === true;
-        const crossedRugTrigger = confirmedPostMigrationPoll
-          && Number.isFinite(marketCapUsd)
-          && marketCapUsd >= migrationExecutionSettings.boostEntryMinMarketCapUsd
-          && marketCapUsd <= migrationExecutionSettings.boostEntryMarketCapUsd;
-        console.log(`[BOOST watch] ${candidate.mint} (${candidate.symbol}) poll: mc=${marketCapUsd} inRange=${crossedRugTrigger} t=${new Date().toISOString()}`);
+        const crossedRugTrigger = confirmedPostMigrationPoll && reachesDipRebound(marketCapUsd, mark.quotedAt);
+        console.log(`[BOOST watch] ${candidate.mint} (${candidate.symbol}) poll: mc=${marketCapUsd} low=${Number.isFinite(lowestObservedMarketCapUsd) ? lowestObservedMarketCapUsd : "waiting"} reboundTrigger=${crossedRugTrigger} t=${new Date().toISOString()}`);
         if (crossedRugTrigger) {
           triggerCandidate = {
             ...candidate,
@@ -999,7 +1010,8 @@ export default function LockstepApp() {
     migrationWatchInFlight.current.delete(candidate.mint);
     if (!triggerCandidate) {
       if (Date.now() >= entryDeadline) {
-        addExecutionActivity(`${candidate.symbol} BOOST entry closed`, `No buy submitted because only ${minimumBoostRemainingSeconds}s remained · the coin did not enter ${rugTriggerLabel} before the configured cutoff`, "neutral", candidate.mint);
+        const lowDetail = Number.isFinite(lowestObservedMarketCapUsd) ? ` · lowest observed ${formatUsdMarketCap(lowestObservedMarketCapUsd)}` : " · no usable live low was observed";
+        addExecutionActivity(`${candidate.symbol} BOOST entry closed`, `No buy submitted because only ${minimumBoostRemainingSeconds}s remained · no ${requiredReboundPercent.toFixed(1)}% rebound completed inside ${rugTriggerLabel}${lowDetail}`, "neutral", candidate.mint);
       } else {
         addExecutionActivity(`${candidate.symbol} watch cancelled`, `Automation left the active state mid-watch (mode: ${engineModeRef.current}) · this candidate was dropped`, "warn", candidate.mint);
       }
@@ -1014,7 +1026,8 @@ export default function LockstepApp() {
     const triggerPoolLabel = triggerCandidate.observationPool
       ? triggerCandidate.observationPool === "pump-amm" ? "pump-amm" : `pump-amm (${shortAddress(triggerCandidate.observationPool)})`
       : "verified PumpSwap";
-    const triggerReceipt = `${triggerCandidate.observationSource === "trade-stream" ? "PumpPortal reported" : "Trigger"} ${formatUsdMarketCap(triggerMarketCapUsd)} · ${triggerSourceLabel} · pool ${triggerPoolLabel}`;
+    const lowAgeMs = lowestObservedAt > 0 ? Math.max(0, Number(triggerCandidate.observedAt ?? Date.now()) - lowestObservedAt) : 0;
+    const triggerReceipt = `Low ${formatUsdMarketCap(triggerLowMarketCapUsd)} · rebound ${triggerReboundPercent.toFixed(1)}% to ${formatUsdMarketCap(triggerMarketCapUsd)} in ${Math.round(lowAgeMs)}ms · ${triggerSourceLabel} · pool ${triggerPoolLabel}`;
     // Both websocket trades and completed HTTP polls are valid observations.
     // Re-fetch only after a signal has actually become stale; a duplicate
     // request here was adding enough latency for fast coins to leave the band.
@@ -1260,7 +1273,7 @@ export default function LockstepApp() {
     setPaperCash(nextCash);
     setPaperRealizedPnl(nextPnl);
     setPaperPositions(nextPositions);
-    addExecutionActivity(`Paper bought ${position.symbol}`, `${executableBuyAmount.toFixed(4)} fake SOL exact order · live transaction build passed · ${formatUsdMarketCap(position.entryMarketCapUsd)} · ${totalExecutionSlippage.toFixed(1)}% modeled entry impact + fees · BOOST trigger ${Math.max(0, Math.round((Date.now() - migrationStartedAt) / 1000))}s after migration`, "good", position.mint);
+    addExecutionActivity(`Paper bought ${position.symbol}`, `${triggerReceipt} · projected paper fill ${formatUsdMarketCap(position.entryMarketCapUsd)} · ${executableBuyAmount.toFixed(4)} fake SOL exact order · live transaction build passed · ${totalExecutionSlippage.toFixed(1)}% modeled entry impact + fees · ${Math.max(0, Math.round((Date.now() - migrationStartedAt) / 1000))}s after migration`, "good", position.mint);
   }, [addExecutionActivity, migrationLiveSettings, migrationSettings, realizedPnl, refreshBalance, solUsdPrice]);
 
   useEffect(() => {
@@ -1614,7 +1627,7 @@ export default function LockstepApp() {
             <div className="panel-heading"><div><small>STRATEGY</small><h2>{paperMode ? "Migration Paper Lab" : migrationLiveMode ? "Migration Live" : "New Pairs Live"}</h2></div><button className="text-button" onClick={() => setSettingsOpen(true)}>EDIT</button></div>
             <div className="strategy-switch" role="group" aria-label="Trading strategy"><button className={migrationLiveMode ? "selected danger-edge" : ""} onClick={() => changeStrategy("migration-live")}><b>Migration Live</b><small>Real feed · real SOL</small></button><button className={strategyMode === "new-pairs-live" ? "selected danger-edge" : ""} onClick={() => changeStrategy("new-pairs-live")}><b>New Pairs Live</b><small>Real feed · real SOL</small></button><button className={paperMode ? "selected paper-choice" : "paper-choice"} onClick={() => changeStrategy("migration-paper")}><b>Paper Lab</b><small>Fake SOL · isolated</small></button></div>
             <div className="order-size"><span>{paperMode ? "PAPER ORDER SIZE" : "REAL ORDER SIZE"}</span><b>{strategyMode === "new-pairs-live" ? `${newPairsSettings.buyAmount} → ${newPairsSettings.adaptiveBuyAmount}` : `${activeSettings.buyAmount}`} <small>{paperMode ? "FAKE SOL" : "SOL"}</small></b></div>
-            <div className="strategy-rules"><Rule label="Max positions" value={String(activeSettings.maxPositions)} /><Rule label="Daily loss limit" value={`${activeSettings.dailyLoss} ${paperMode ? "fake SOL" : "SOL"}`} danger />{strategyMode !== "new-pairs-live" ? <><Rule label="Entry range" value={`${formatUsdMarketCap(migrationDisplaySettings.boostEntryMinMarketCapUsd)}–${formatUsdMarketCap(migrationDisplaySettings.boostEntryMarketCapUsd)}`} good /><Rule label="Maximum average fill" value={formatUsdMarketCap(migrationDisplaySettings.boostMaximumFillMarketCapUsd)} good /><Rule label={paperMode ? "Exact paper order" : "Exact live order"} value={`${migrationDisplaySettings.buyAmount} ${paperMode ? "fake SOL" : "SOL"}`} danger /><Rule label="Buy slippage" value={`${migrationDisplaySettings.slippage}%`} danger /><Rule label="Sell slippage" value={`${migrationDisplaySettings.exitImpact}%`} danger /><Rule label="Buy priority fee" value={`${migrationDisplaySettings.buyPriorityFeeSol} SOL`} danger /><Rule label="Sell priority fee" value={`${migrationDisplaySettings.sellPriorityFeeSol} SOL`} /><Rule label="Timed sell" value={`${migrationDisplaySettings.boostSellSlicePercent}% remaining every ${migrationDisplaySettings.boostSellIntervalSeconds}s`} /><Rule label="Profit exit" value={`+${migrationDisplaySettings.takeProfit}% · sell all`} good /><Rule label="Five-minute full exit" value={migrationDisplaySettings.boostHardExitEnabled ? "ON" : "OFF · manual exit"} /></> : <><Rule label="Stop loss" value={`−${activeSettings.stopLoss}%`} danger /><Rule label="Quote-up size" value={`${newPairsSettings.adaptiveBuyAmount} SOL`} good /><Rule label="Live impact gate" value={`<${newPairsSettings.maxQuoteImpact}%`} /><Rule label="Take profit" value={`+${activeSettings.takeProfit}%`} good /><Rule label="Maximum hold" value={`${activeSettings.maxHold}s`} /><Rule label="Transaction slippage" value={`${activeSettings.slippage}%`} /><Rule label="Buy priority fee" value={`${newPairsSettings.buyPriorityFeeSol} SOL`} danger /><Rule label="Sell priority fee" value={`${newPairsSettings.sellPriorityFeeSol} SOL`} /></>}</div>
+            <div className="strategy-rules"><Rule label="Max positions" value={String(activeSettings.maxPositions)} /><Rule label="Daily loss limit" value={`${activeSettings.dailyLoss} ${paperMode ? "fake SOL" : "SOL"}`} danger />{strategyMode !== "new-pairs-live" ? <><Rule label="Entry range" value={`${formatUsdMarketCap(migrationDisplaySettings.boostEntryMinMarketCapUsd)}–${formatUsdMarketCap(migrationDisplaySettings.boostEntryMarketCapUsd)}`} good /><Rule label="Dip rebound" value={`${migrationDisplaySettings.boostReboundPercent}% from live low`} good /><Rule label="Maximum average fill" value={formatUsdMarketCap(migrationDisplaySettings.boostMaximumFillMarketCapUsd)} good /><Rule label={paperMode ? "Exact paper order" : "Exact live order"} value={`${migrationDisplaySettings.buyAmount} ${paperMode ? "fake SOL" : "SOL"}`} danger /><Rule label="Buy slippage" value={`${migrationDisplaySettings.slippage}%`} danger /><Rule label="Sell slippage" value={`${migrationDisplaySettings.exitImpact}%`} danger /><Rule label="Buy priority fee" value={`${migrationDisplaySettings.buyPriorityFeeSol} SOL`} danger /><Rule label="Sell priority fee" value={`${migrationDisplaySettings.sellPriorityFeeSol} SOL`} /><Rule label="Timed sell" value={`${migrationDisplaySettings.boostSellSlicePercent}% remaining every ${migrationDisplaySettings.boostSellIntervalSeconds}s`} /><Rule label="Profit exit" value={`+${migrationDisplaySettings.takeProfit}% · sell all`} good /><Rule label="Five-minute full exit" value={migrationDisplaySettings.boostHardExitEnabled ? "ON" : "OFF · manual exit"} /></> : <><Rule label="Stop loss" value={`−${activeSettings.stopLoss}%`} danger /><Rule label="Quote-up size" value={`${newPairsSettings.adaptiveBuyAmount} SOL`} good /><Rule label="Live impact gate" value={`<${newPairsSettings.maxQuoteImpact}%`} /><Rule label="Take profit" value={`+${activeSettings.takeProfit}%`} good /><Rule label="Maximum hold" value={`${activeSettings.maxHold}s`} /><Rule label="Transaction slippage" value={`${activeSettings.slippage}%`} /><Rule label="Buy priority fee" value={`${newPairsSettings.buyPriorityFeeSol} SOL`} danger /><Rule label="Sell priority fee" value={`${newPairsSettings.sellPriorityFeeSol} SOL`} /></>}</div>
             <div className="browser-note"><i>◉</i><span><b>{paperMode ? "Isolated paper execution" : "Browser-bound real execution"}</b><small>{paperMode ? "No code path in this lab can sign or submit a transaction." : "Keep this tab open and wallet unlocked. Live activation is always confirmed separately."}</small></span></div>
             {paperMode && <button className="refresh-button" onClick={resetPaperWallet}>↻ Reset paper wallet to {migrationSettings.paperStartingBalance.toFixed(2)} fake SOL</button>}
           </aside>
@@ -1721,6 +1734,7 @@ function SettingsDrawer({ initialMode, migrationSettings, migrationLiveSettings,
       boostEntryMinMarketCapUsd,
       boostEntryMarketCapUsd,
       boostMaximumFillMarketCapUsd: Math.max(boostEntryMarketCapUsd, value.boostMaximumFillMarketCapUsd),
+      boostReboundPercent: Math.min(100, Math.max(0, value.boostReboundPercent)),
       boostMinimumRemainingSeconds: Math.min(MIGRATION_WINDOW_SECONDS - 1, Math.max(0, Math.round(value.boostMinimumRemainingSeconds))),
       buyPriorityFeeSol: Math.min(0.06, Math.max(0.000001, value.buyPriorityFeeSol)),
       sellPriorityFeeSol: Math.min(0.06, Math.max(0.000001, value.sellPriorityFeeSol)),
@@ -1742,6 +1756,7 @@ function SettingsDrawer({ initialMode, migrationSettings, migrationLiveSettings,
           {paperMode && field("Paper starting balance", "paperStartingBalance", "FAKE SOL", 0.1)}
           <NumberField label="Entry minimum" suffix="USD MC" value={migrationModeDraft.boostEntryMinMarketCapUsd} step={100} onChange={(value) => setMigrationValue("boostEntryMinMarketCapUsd", value)} />
           <NumberField label="Entry maximum" suffix="USD MC" value={migrationModeDraft.boostEntryMarketCapUsd} step={100} onChange={(value) => setMigrationValue("boostEntryMarketCapUsd", value)} />
+          <NumberField label="Buy after rebound" suffix="% FROM LIVE LOW" value={migrationModeDraft.boostReboundPercent} step={0.5} max={100} onChange={(value) => setMigrationValue("boostReboundPercent", value)} />
           <NumberField label="Maximum average fill" suffix="USD MC" value={migrationModeDraft.boostMaximumFillMarketCapUsd} step={100} onChange={(value) => setMigrationValue("boostMaximumFillMarketCapUsd", value)} />
           <NumberField label="Stop new entries with" suffix="SEC BOOST LEFT" value={migrationModeDraft.boostMinimumRemainingSeconds} step={1} max={MIGRATION_WINDOW_SECONDS - 1} onChange={(value) => setMigrationValue("boostMinimumRemainingSeconds", value)} />
           {field("Buy slippage", "slippage", "%", 0.1)}
